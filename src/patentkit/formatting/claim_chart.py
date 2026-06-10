@@ -64,8 +64,9 @@ def _finding_cell_markdown(finding: Optional[DisclosureFinding]) -> str:
     parts = [f"**{_STATUS_LABEL[finding.status]}**"]
     if finding.reasoning:
         parts.append(_md_escape(finding.reasoning))
-    for quote in finding.quotes:
-        cite = f" ({finding.citation})" if finding.citation else ""
+    for i, quote in enumerate(finding.quotes):
+        # the citation was located from the first quote only (see assess_reference)
+        cite = f" ({finding.citation})" if finding.citation and i == 0 else ""
         parts.append(f"“{_md_escape(quote)}”{cite}")
     return "<br>".join(parts)
 
@@ -108,8 +109,10 @@ def claim_chart_html(chart: ClaimChart) -> str:
                 cells.append("<td>—</td>")
                 continue
             quote_html = "".join(
-                f"<blockquote>{esc(q)}{(' <i>(' + esc(finding.citation) + ')</i>') if finding.citation else ''}</blockquote>"
-                for q in finding.quotes
+                f"<blockquote>{esc(q)}"
+                f"{(' <i>(' + esc(finding.citation) + ')</i>') if finding.citation and qi == 0 else ''}"
+                "</blockquote>"
+                for qi, q in enumerate(finding.quotes)
             )
             cells.append(
                 f'<td style="background-color:{_STATUS_CSS[finding.status]}">'
@@ -176,12 +179,12 @@ def claim_chart_docx(chart: ClaimChart, out_path: str, color_coding: bool = True
             status_par.add_run(_STATUS_LABEL[finding.status]).bold = True
             if finding.reasoning:
                 cell.add_paragraph(finding.reasoning)
-            for quote in finding.quotes:
+            for qi, quote in enumerate(finding.quotes):
                 par = cell.add_paragraph()
                 run = par.add_run(f"“{quote}”")
                 run.italic = True
                 run.font.size = Pt(9)
-                if finding.citation:
+                if finding.citation and qi == 0:
                     par.add_run(f" [{finding.citation}]").font.size = Pt(9)
             if color_coding:
                 shade(cell, _STATUS_FILL[finding.status])

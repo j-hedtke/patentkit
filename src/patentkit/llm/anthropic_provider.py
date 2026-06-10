@@ -9,6 +9,11 @@ from patentkit.llm.base import LLM, ChatMessage, LLMResponse
 from patentkit.llm.tools import ToolCall, ToolDef, ToolRound
 
 
+#: model families where the API removed sampling params (temperature/top_p/top_k
+#: return 400): Fable 5 and Opus 4.7+. Sonnet/Haiku 4.x and Opus <=4.6 still accept them.
+_NO_SAMPLING_PREFIXES = ("claude-fable", "claude-opus-4-7", "claude-opus-4-8")
+
+
 def _to_anthropic_messages(messages: list[dict]) -> list[dict]:
     """Translate the neutral message schema into Anthropic content blocks."""
     out: list[dict] = []
@@ -47,9 +52,10 @@ class AnthropicLLM(LLM):
         kwargs = dict(
             model=self.model,
             max_tokens=max_tokens,
-            temperature=temperature,
             messages=[{"role": m.role, "content": m.content} for m in messages],
         )
+        if not self.model.startswith(_NO_SAMPLING_PREFIXES):
+            kwargs["temperature"] = temperature
         if system:
             kwargs["system"] = system
         if stop:

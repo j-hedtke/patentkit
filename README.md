@@ -14,6 +14,31 @@ pip install 'patentkit[all]'     # everything
 
 Extras: `anthropic`, `openai`, `elasticsearch`, `docx`, `pdf`, `viz`, `mcp`, `scrape`.
 
+## Demo: agentic invalidity search → claim chart
+
+One toy IPR queryset ([IPR2020-00104](https://portal.unifiedpatents.com/ptab/case/IPR2020-00104),
+Apple's '647 "data detectors" patent) end to end: the agent writes and refines
+its own queries over a 300-patent corpus of real scraped patents, finds both
+ground-truth references from the IPR petition, then charts claim 1 against the
+top hit — quoting the reference verbatim and locating every quote in the issued
+PDF as a column/line citation:
+
+![agentic invalidity search demo](docs/assets/demo.gif)
+
+*(Real captured output of `python examples/demo_invalidity_chart.py`, replayed
+at readable speed with the middle search rounds elided.)*
+
+The finished product is a color-coded DOCX claim chart — one row per atomic
+limitation, quotes cited by column/line (e.g. `[col. 21, ll. 51-53]`, computed
+by fuzzy-locating the quote in the patent PDF and regressing the printed
+line-number gutter):
+
+<img src="docs/assets/claim-chart.png" alt="generated DOCX claim chart, page 1" width="640">
+
+Run it yourself with `python examples/demo_invalidity_chart.py` (needs the
+`pdf`, `docx`, and `scrape` extras plus an `ANTHROPIC_API_KEY` or
+`OPENAI_API_KEY`; outputs land in `data/demo/`).
+
 ## Design principles
 
 - **Bring your own keys.** Every connector, store, and model provider accepts

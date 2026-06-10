@@ -1,0 +1,66 @@
+
+━━━ 1/5 ━━━ corpus — toy IPR queryset US5946647A (IPR2020-00104)
+corpus: 300 real patents from data/eval_corpus/corpus.jsonl
+target: US5946647A — System and method for performing an action on a structure in computer-generated data
+ground-truth prior art (from the IPR petition): US5644735A, US5859636A
+
+━━━ 2/5 ━━━ agentic invalidity search (model-driven tool-use loop, BM25 store)
+agentic invalidity search: cutoff 1996-02-01, budget 120s / 16 steps
+assistant_text: I'll systematically search for prior art that anticipates or renders obvious the claims of US5946647A, which relates to detecting structures in data and perform
+agent -> search_patents: {"keywords": ["detecting structures in data", "performing actions on detected structures", "analyzer server", "linking actions to structures"], "fields": ["titl
+search_patents -> {"count": 2, "results": [{"number": "US5608387A", "title": "Personal identification devices and access control systems", "date": "1991-11-30", "score": 3.1824, 
+agent -> search_patents: {"keywords": ["pattern recognition text", "phone number detection", "hyperlink action", "structured data recognition"], "fields": ["title", "abstract", "claims"
+search_patents -> {"count": 2, "results": [{"number": "US5644735A", "title": "Method and apparatus for providing implicit computer-implemented assistance", "date": "1992-05-27", 
+agent -> search_patents: {"keywords": ["recognizing data patterns", "user interface action", "telephone number", "address recognition"], "fields": ["title", "abstract", "claims"], "befo
+search_patents -> {"count": 8, "results": [{"number": "US5859636A", "title": "Recognition of and operation on text data", "date": "1995-12-27", "score": 7.2454, "passages": ["cla
+assistant_text: US5859636A looks very promising. Let me get details on it and also search more specifically.
+agent -> get_patent: {"number": "US5859636A"}
+get_patent -> {"number": "US5859636A", "title": "Recognition of and operation on text data", "abstract": "Text of a predetermined class is recognized in a body of text. After
+agent -> search_patents: {"keywords": ["text recognition", "action", "telephone number", "email address", "URL", "user interface selection"], "fields": ["title", "abstract", "claims"], 
+search_patents -> {"count": 7, "results": [{"number": "US5859636A", "title": "Recognition of and operation on text data", "date": "1995-12-27", "score": 5.8774, "passages": ["lai
+agent -> search_patents: {"keywords": ["intelligent text", "hypertext", "data detection", "action processor", "user interface"], "fields": ["title", "abstract", "claims"], "before_date"
+search_patents -> {"count": 8, "results": [{"number": "US5644735A", "title": "Method and apparatus for providing implicit computer-implemented assistance", "date": "1992-05-27", 
+assistant_text: US5859636A has a priority date of 1995-12-27, which is AFTER the cutoff of 1996-02-01... wait, let me reconsider. The cutoff is before 1996-02-01, but the prior
+agent -> get_patent: {"number": "US5644735A"}
+get_patent -> {"number": "US5644735A", "title": "Method and apparatus for providing implicit computer-implemented assistance", "abstract": "A method and apparatus for providi
+agent -> search_patents: {"keywords": ["automatic recognition", "data type", "action", "context sensitive", "popup menu", "right click"], "fields": ["title", "abstract", "claims"], "bef
+search_patents -> {"count": 4, "results": [{"number": "US5644735A", "title": "Method and apparatus for providing implicit computer-implemented assistance", "date": "1992-05-27", 
+agent -> search_patents: {"keywords": ["hypertext link", "embedded action", "document", "user selection", "launch application"], "fields": ["title", "abstract", "claims"], "before_date"
+search_patents -> {"count": 7, "results": [{"number": "US5644735A", "title": "Method and apparatus for providing implicit computer-implemented assistance", "date": "1992-05-27", 
+assistant_text: US5859636A has a priority date of 1995-12-27, which is before the cutoff. Let me now look more carefully at other potential prior art. Let me search for more sp
+
+        ··· 26 more search rounds elided (full run: 41 tool calls, ~2 min) ···
+
+system: STOP: the search budget is exhausted. Do not issue any more searches. Call the 'finish' tool IMMEDIATELY with your best current answer based on what you have se
+agent -> finish: {"candidates": [{"number": "US5859636A", "why": "Most directly anticipates Claim 1: recognizes selected text as belonging to a predetermined class (phone number
+finish -> {"ok": true, "accepted": 5, "rejected": []}
+
+stop_reason=max_steps; top 5 candidates:
+  1. US5859636A  Recognition of and operation on text data ◀ ground truth
+     why: Most directly anticipates Claim 1: recognizes selected text as belonging to a predetermined class (phone number, email a
+  2. US5644735A  Method and apparatus for providing implicit computer-impleme ◀ ground truth
+     why: Discloses a computer system with a 'smart field' that detects information of a predefined type (phone numbers, persons, 
+  3. US5644735A  Method and apparatus for providing implicit computer-impleme ◀ ground truth
+     why: Already ranked #2 above; listed separately here to note that the explicit combination of US5644735A (smart field detecti
+  4. US5586317A  Method and apparatus for implementing I/O in a frame-based c
+     why: Discloses a frame-based computer system (with CPU, memory, input means, output means) where frame objects detect inputs 
+  5. US5943055A  Computer interface method and system
+     why: Discloses a computer/telephone station system (sharing CPC code H04M1/27475 with the target patent) that presents data i
+
+━━━ 3/5 ━━━ column/line locator — issued PDF for US5859636A
+PDF: data/demo/US5859636A.pdf — quotes will be fuzzy-located and cited by col./line
+
+━━━ 4/5 ━━━ claim chart — US5946647A claim 1 vs US5859636A
+splitting claim into atomic limitations, assessing disclosure per
+limitation with verbatim quotes (one HIGH-effort LLM call each)...
+
+one element, fully traced:
+  limitation: A computer-based system for detecting structures in data and performing actions on detected structures.
+  status:     disclosed
+  quote:      "The invention pertains to recognition of text in a body of text as belonging to a predetermined class and performing an operation relevant to the recognized tex"
+  citation:   US5859636A, col. 21, ll. 51-53
+
+━━━ 5/5 ━━━ finished product — color-coded DOCX claim chart
+Wrote claim chart to data/demo/claim_chart_US5946647A_claim1.docx
+wrote data/demo/claim_chart_US5946647A_claim1.docx
+coverage — US5859636A: 100%; combined: 100%
