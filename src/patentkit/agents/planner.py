@@ -1,11 +1,16 @@
-"""Agentic search planning.
+"""Search planning: the cheap pre-run preview shown to users.
 
-``plan_search`` asks a HIGH-effort LLM to decompose an invalidity / FTO /
-infringement task into several complementary keyword queries (a
-:class:`SearchPlan`), with a documented run-time estimate attached. Every
-path degrades gracefully when no LLM (or no API key) is available: the plan
-falls back to a single keyword query built from the most distinctive
-title/claim terms (``_fallback_keywords``), so the toolkit works keys-free.
+Since the search agents moved to the pure agentic core (the LLM generates
+and refines its own queries at execution time, inside one tool-use
+conversation), the :class:`SearchPlan` is no longer "the queries that will
+be executed" — it is the *pre-run user-visible contract*: a deterministic
+preview of the initial query angles plus a wall-clock estimate.
+
+**Design choice (documented):** :func:`plan_search` derives the preview from
+the same inputs the agent's system prompt gets (title/claim terms, CPC
+codes, product description) WITHOUT any LLM call, so starting a guided
+session is instant and keys-free. The agent is free to (and expected to)
+go beyond these angles at execution time.
 
 :class:`QuerySpec` is a pydantic mirror of the
 :class:`~patentkit.search.base.SearchQuery` dataclass so plans serialize
@@ -14,7 +19,6 @@ cleanly through MCP / OpenAI tool calls.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import re
@@ -43,8 +47,12 @@ using via wherein whereby which with
 
 #: corpus size assumed when none is known (used for the initial plan estimate)
 DEFAULT_CORPUS_SIZE = 100_000
-#: number of candidates assumed to flow into an LLM rerank stage
-DEFAULT_RERANK_CANDIDATES = 100
+
+#: one agent round ≈ model latency + tool execution (rough single-machine figure)
+PER_STEP_LLM_SECONDS = 5.0
+#: agent rounds expected beyond the per-angle searches (read task, inspect,
+#: shortlist, finish)
+BASE_AGENT_STEPS = 4
 
 
 class QuerySpec(BaseModel):
@@ -129,14 +137,18 @@ def _parse_numbers(raw: list[str]) -> list[PatentNumber]:
 
 
 class PlannedQuery(BaseModel):
-    """One query of a search plan, with the reason it was included."""
+    """One preview angle of a search plan, with the reason it was included."""
 
     purpose: str
     query: QuerySpec
 
 
 class SearchPlan(BaseModel):
-    """An agent-produced plan: complementary queries plus exclusions."""
+    """The pre-run contract: initial query angles + exclusions + estimate.
+
+    The agentic searcher treats these as starting guidance only; it
+    generates, executes, and refines its own queries at run time.
+    """
 
     search_type: Literal["invalidity", "fto", "infringement"]
     target: str
@@ -186,59 +198,6 @@ def _fallback_keywords(
     return ordered[:max_keywords]
 
 
-_PLAN_PROMPT = """You are planning a {search_type} prior-art/patent search.
-Target:
-{target_block}
-
-Produce a JSON array of {n_queries} complementary search query specs. Each item:
-{{"purpose": "<why this query>", "keywords": [...], "required_keywords": [...],
-  "excluded_keywords": [...], "art_classes": ["CPC prefixes"],
-  "before_date": "YYYY-MM-DD" or null, "after_date": "YYYY-MM-DD" or null,
-  "text": "optional free-text semantic query"}}
-Vary the angle across queries (synonyms, adjacent technology, implementation
-details, problem-oriented phrasing). Respond with ONLY the JSON array."""
-
-
-def _target_block(patent: Patent | None, product_description: str | None,
-                  claims: list[int] | None) -> str:
-    parts: list[str] = []
-    if patent is not None:
-        parts.append(f"Patent {patent.patent_number}: {patent.title or '(untitled)'}")
-        if patent.abstract:
-            parts.append(f"Abstract: {patent.abstract[:600]}")
-        if patent.cpc_codes:
-            parts.append("CPC: " + ", ".join(patent.cpc_codes[:8]))
-        selected = patent.claims
-        if claims:
-            selected = [c for c in patent.claims if c.number in set(claims)] or patent.claims
-        for claim in selected[:4]:
-            parts.append(f"Claim {claim.number}: {claim.text[:800]}")
-    if product_description:
-        parts.append(f"Product description: {product_description[:1200]}")
-    return "\n".join(parts) or "(no target details provided)"
-
-
-def _coerce_query_spec(item: dict, *, before_date: date | None) -> QuerySpec | None:
-    """Validate/coerce one LLM-emitted query dict into a QuerySpec."""
-    if not isinstance(item, dict):
-        return None
-    allowed = set(QuerySpec.model_fields)
-    cleaned = {k: v for k, v in item.items() if k in allowed and v is not None}
-    for key in ("keywords", "required_keywords", "excluded_keywords", "art_classes"):
-        if key in cleaned and isinstance(cleaned[key], str):
-            cleaned[key] = [cleaned[key]]
-    try:
-        spec = QuerySpec(**cleaned)
-    except Exception:  # pydantic ValidationError without importing it here
-        logger.warning("Discarding malformed query spec from LLM: %r", item)
-        return None
-    if before_date and spec.before_date is None:
-        spec.before_date = before_date
-    if not spec.keywords and not spec.text and not spec.required_keywords:
-        return None
-    return spec
-
-
 def plan_search(
     search_type: Literal["invalidity", "fto", "infringement"],
     *,
@@ -246,24 +205,25 @@ def plan_search(
     product_description: str | None = None,
     claims: list[int] | None = None,
     llm=None,
-    n_queries: int = 4,
+    n_queries: int = 3,
 ) -> SearchPlan:
-    """Plan a multi-query search with a HIGH-effort LLM.
+    """Derive the pre-run plan preview — deterministically, no LLM call.
 
-    The LLM is prompted (seeded with the patent title/claims/CPC codes or the
-    product description) for a JSON array of query specs. On any LLM or JSON
-    failure — including ``llm=None`` — the plan falls back to a single
-    keyword query built by :func:`_fallback_keywords`, so planning always
-    succeeds without API keys.
+    Up to ``n_queries`` complementary starting angles are derived from the
+    same inputs the agent's system prompt gets: (1) broad distinctive
+    title/claim (or product) terms, (2) a tighter query requiring the most
+    distinctive title terms, (3) a CPC-class-constrained query when the
+    target carries classifications. The executing agent treats these as
+    guidance only and generates its own queries.
 
     Args:
         search_type: "invalidity", "fto", or "infringement".
         patent: the target patent (invalidity / infringement).
         product_description: the target product (FTO).
         claims: claim numbers in focus (default: all/independent).
-        llm: an :class:`patentkit.llm.LLM`; pass ``get_llm("high")`` in
-            production. ``None`` skips the LLM entirely.
-        n_queries: how many complementary queries to request.
+        llm: only used to decide whether the run will be agentic (affects
+            the time estimate); never called here.
+        n_queries: maximum preview angles.
 
     Returns:
         A :class:`SearchPlan` with ``estimated_seconds`` attached (computed
@@ -274,40 +234,32 @@ def plan_search(
     before = patent.best_effective_date() if (patent and search_type == "invalidity") else None
     exclusions = sorted(patent.examiner_cited_numbers) if (patent and search_type == "invalidity") else []
 
-    queries: list[PlannedQuery] = []
-    rationale = ""
-    if llm is not None:
-        prompt = _PLAN_PROMPT.format(
-            search_type=search_type,
-            target_block=_target_block(patent, product_description, claims),
-            n_queries=n_queries,
-        )
-        try:
-            raw = llm.complete_json(prompt, max_tokens=2048)
-            if isinstance(raw, dict):  # tolerate {"queries": [...]}
-                raw = raw.get("queries", [raw])
-            for item in raw if isinstance(raw, list) else []:
-                spec = _coerce_query_spec(item, before_date=before)
-                if spec is not None:
-                    purpose = str(item.get("purpose", "planned query")) if isinstance(item, dict) else "planned query"
-                    queries.append(PlannedQuery(purpose=purpose, query=spec))
-            rationale = f"LLM-planned {len(queries)} complementary queries."
-        except Exception as exc:  # noqa: BLE001 — any LLM/JSON failure falls back
-            logger.warning("plan_search LLM planning failed (%s); using fallback keywords", exc)
-            queries = []
-
-    if not queries:
-        keywords = _fallback_keywords(patent, product_description, claims)
-        queries = [PlannedQuery(
-            purpose="fallback keyword query from distinctive title/claim terms",
-            query=QuerySpec(keywords=keywords, before_date=before),
-        )]
-        rationale = "Heuristic fallback plan (no LLM available or LLM output unusable)."
+    keywords = _fallback_keywords(patent, product_description, claims)
+    queries: list[PlannedQuery] = [PlannedQuery(
+        purpose="broad angle: distinctive title/claim terms",
+        query=QuerySpec(keywords=keywords, before_date=before),
+    )]
+    title_terms = [t for t in _TOKEN_RE.findall(((patent.title if patent else "") or "").lower())
+                   if len(t) > 2 and t not in _STOPWORDS][:3]
+    if title_terms and len(queries) < n_queries:
+        queries.append(PlannedQuery(
+            purpose="tight angle: core title terms required",
+            query=QuerySpec(keywords=keywords, required_keywords=title_terms,
+                            before_date=before),
+        ))
+    cpc_prefixes = sorted({code[:4] for code in (patent.cpc_codes if patent else [])})[:4]
+    if cpc_prefixes and len(queries) < n_queries:
+        queries.append(PlannedQuery(
+            purpose="classification angle: same CPC art classes",
+            query=QuerySpec(keywords=keywords, art_classes=cpc_prefixes,
+                            before_date=before),
+        ))
 
     plan = SearchPlan(
         search_type=search_type,
         target=target,
-        rationale=rationale,
+        rationale=("Deterministic pre-run preview of starting angles; the agent "
+                   "generates and refines its own queries during execution."),
         queries=queries,
         exclusions=exclusions,
     )
@@ -325,24 +277,28 @@ def estimate_search_seconds(
 ) -> float:
     """Estimate wall-clock seconds for executing ``plan``.
 
-    Heuristic (all constants are rough single-machine figures):
+    Agentic model (all constants are rough single-machine figures):
 
-    - **per-query base**: 2.0 s setup/IO per planned query;
-    - **corpus factor**: 0.6 s x log10(corpus_size + 10) per query — index
-      scans grow roughly logarithmically with corpus size for both BM25
-      heaps and ANN search;
-    - **LLM rerank**: a single batched relevance call costs ~8 s overhead
-      plus ~0.12 s per candidate (prompt-size growth), candidates capped at
-      :data:`DEFAULT_RERANK_CANDIDATES`;
-    - **charting**: ~45 s per claim charted (one HIGH-effort LLM pass per
-      claim across references).
+    - **agentic run** (``with_llm_rerank=True``): the cost is dominated by
+      provider rounds — expected steps ≈ :data:`BASE_AGENT_STEPS` + 2 per
+      planned angle (a search round + an inspect/refine round each), at
+      :data:`PER_STEP_LLM_SECONDS` per step plus a per-step tool cost that
+      grows logarithmically with corpus size;
+    - **degraded run** (no LLM): a single keyword pass per angle, ~0.5 s
+      setup plus the same logarithmic index-scan factor;
+    - **charting**: ~45 s per claim charted afterwards (one HIGH-effort LLM
+      pass per claim across references).
 
-    The estimate is monotonically non-decreasing in every argument.
+    The estimate is monotonically increasing in every argument, and with the
+    default budgets stays within the ≤3-minute envelope the agents enforce.
     """
     n_queries = max(1, len(plan.queries))
-    seconds = n_queries * (2.0 + 0.6 * math.log10(corpus_size + 10))
+    corpus_factor = 0.3 * math.log10(corpus_size + 10)
     if with_llm_rerank:
-        seconds += 8.0 + 0.12 * min(corpus_size, DEFAULT_RERANK_CANDIDATES)
+        expected_steps = BASE_AGENT_STEPS + 2 * n_queries
+        seconds = expected_steps * (PER_STEP_LLM_SECONDS + corpus_factor)
+    else:
+        seconds = 2.0 + n_queries * (0.5 + corpus_factor)
     seconds += 45.0 * max(0, charting_claims)
     return round(seconds, 1)
 
@@ -356,53 +312,18 @@ def humanize_seconds(s: float) -> str:
     return f"{s / 3600:.1f} hours"
 
 
-_REVISE_PROMPT = """You previously produced this {search_type} search plan (JSON):
-{plan_json}
-
-The user gave this feedback:
-{feedback}
-
-Produce a REVISED JSON array of query specs (same schema: purpose, keywords,
-required_keywords, excluded_keywords, art_classes, before_date, after_date,
-text). Keep queries the user liked, fix or drop the ones criticized, and
-incorporate the free-text guidance. Respond with ONLY the JSON array."""
-
-
 def revise_plan(plan: SearchPlan, feedback: SearchFeedback, llm=None) -> SearchPlan:
-    """Revise a plan from user feedback (HIGH-effort LLM when available).
+    """Revise the pre-run plan preview from user feedback — heuristically.
 
-    Without an LLM (or on LLM failure) deterministic heuristics apply:
-    queries judged ``off_topic`` are dropped, ``too_broad`` queries get a
-    tighter ``minimum_match``, ``too_narrow`` ones get it relaxed, and
-    patents marked irrelevant are added to the plan's exclusions.
+    No LLM call is made (result-stage feedback is instead injected into the
+    resumed agent conversation by the guided loop): queries judged
+    ``off_topic`` are dropped, ``too_broad`` queries get a tighter
+    ``minimum_match``, ``too_narrow`` ones get it relaxed, and patents
+    marked irrelevant are added to the plan's exclusions. ``llm`` is
+    accepted for API compatibility and ignored.
     """
+    del llm  # plan revision is deterministic; feedback reaches the agent directly
     revised = plan.model_copy(deep=True)
-    if llm is not None:
-        try:
-            prompt = _REVISE_PROMPT.format(
-                search_type=plan.search_type,
-                plan_json=json.dumps(plan.model_dump(mode="json"), indent=1)[:6000],
-                feedback=feedback.summary_for_llm(),
-            )
-            raw = llm.complete_json(prompt, max_tokens=2048)
-            if isinstance(raw, dict):
-                raw = raw.get("queries", [raw])
-            before = next((q.query.before_date for q in plan.queries if q.query.before_date), None)
-            queries: list[PlannedQuery] = []
-            for item in raw if isinstance(raw, list) else []:
-                spec = _coerce_query_spec(item, before_date=before)
-                if spec is not None:
-                    purpose = str(item.get("purpose", "revised query")) if isinstance(item, dict) else "revised query"
-                    queries.append(PlannedQuery(purpose=purpose, query=spec))
-            if queries:
-                revised.queries = queries
-                revised.rationale = (plan.rationale + " | revised from user feedback").strip(" |")
-                _apply_exclusion_feedback(revised, feedback)
-                return revised
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("revise_plan LLM revision failed (%s); applying heuristics", exc)
-
-    # Heuristic revision path.
     verdicts = {q.query_index: q.verdict for q in feedback.queries}
     kept: list[PlannedQuery] = []
     for i, planned in enumerate(revised.queries):
@@ -411,7 +332,9 @@ def revise_plan(plan: SearchPlan, feedback: SearchFeedback, llm=None) -> SearchP
             continue
         if verdict == "too_broad":
             spec = planned.query
-            spec.minimum_match = min(len(spec.keywords) or 1, (spec.minimum_match or spec.to_search_query().effective_minimum_match()) + 1)
+            spec.minimum_match = min(len(spec.keywords) or 1,
+                                     (spec.minimum_match or
+                                      spec.to_search_query().effective_minimum_match()) + 1)
         elif verdict == "too_narrow":
             spec = planned.query
             spec.minimum_match = max(1, (spec.minimum_match or 2) - 1)
@@ -419,7 +342,7 @@ def revise_plan(plan: SearchPlan, feedback: SearchFeedback, llm=None) -> SearchP
     if kept:
         revised.queries = kept
     _apply_exclusion_feedback(revised, feedback)
-    revised.rationale = (revised.rationale + " | heuristically revised from feedback").strip(" |")
+    revised.rationale = (revised.rationale + " | revised from user feedback").strip(" |")
     return revised
 
 

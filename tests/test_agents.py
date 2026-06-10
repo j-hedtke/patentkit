@@ -1,4 +1,4 @@
-"""Tests for the agents layer: planner, invalidity pipeline, guided loop."""
+"""Tests for the agents layer: planner preview, agentic search, guided loop."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from datetime import date
 import pytest
 
 from patentkit.agents import (
+    AgenticSearchRunner,
     GuidedSearch,
     GuidedSearchSession,
     InvaliditySearchAgent,
@@ -19,7 +20,9 @@ from patentkit.agents import (
     humanize_seconds,
     plan_search,
 )
+from patentkit.agents.fto_search import FtoSearchAgent
 from patentkit.agents.guided import SessionStore
+from patentkit.agents.infringement_search import InfringementSearchAgent
 from patentkit.agents.planner import PlannedQuery, QuerySpec, _fallback_keywords
 from patentkit.models import Citation, Claim, Patent, PatentNumber
 from patentkit.search.bm25 import BM25Store
@@ -121,24 +124,25 @@ def store(corpus: list[Patent]) -> BM25Store:
 
 # ------------------------------------------------------------------ planner
 
-def test_plan_search_falls_back_on_bad_llm_json(target: Patent) -> None:
-    llm = FakeLLM(responses=["this is definitely {{{ not json"])
-    plan = plan_search("invalidity", patent=target, llm=llm, n_queries=4)
+def test_plan_search_is_deterministic_preview_no_llm_call(target: Patent) -> None:
+    llm = FakeLLM()
+    plan = plan_search("invalidity", patent=target, llm=llm)
+    assert llm.prompts == [], "plan preview must not call the LLM"
     assert plan.search_type == "invalidity"
     assert plan.target == "US8123456B2"
-    assert len(plan.queries) == 1  # single fallback query
+    assert plan.queries, "preview must have at least one starting angle"
     keywords = plan.queries[0].query.keywords
-    assert keywords, "fallback keywords must not be empty"
     assert "irrigation" in keywords  # distinctive title term
     # invalidity plans carry the prior-art cutoff and examiner exclusions
-    assert plan.queries[0].query.before_date == date(2008, 4, 10)
+    assert all(q.query.before_date == date(2008, 4, 10) for q in plan.queries)
     assert "US7000003B1" in plan.exclusions
-    assert "fallback" in plan.rationale.lower() or "Heuristic" in plan.rationale
+    assert plan.estimated_seconds and plan.estimated_seconds > 0
+    assert "agent" in plan.rationale
 
 
-def test_plan_search_without_llm_uses_fallback(target: Patent) -> None:
+def test_plan_search_without_llm_works(target: Patent) -> None:
     plan = plan_search("invalidity", patent=target, llm=None)
-    assert len(plan.queries) == 1
+    assert plan.queries
     assert plan.estimated_seconds and plan.estimated_seconds > 0
 
 
@@ -166,15 +170,19 @@ def _plan(n_queries: int) -> SearchPlan:
                                for _ in range(n_queries)])
 
 
-def test_estimate_search_seconds_monotonicity() -> None:
+def test_estimate_search_seconds_monotonicity_agentic_model() -> None:
     base = estimate_search_seconds(_plan(2), corpus_size=1000, with_llm_rerank=False)
     assert base > 0
-    # more queries -> longer
+    # more angles -> longer
     assert estimate_search_seconds(_plan(4), 1000, False) > base
     # bigger corpus -> longer
     assert estimate_search_seconds(_plan(2), 1_000_000, False) > base
-    # LLM rerank -> longer
-    assert estimate_search_seconds(_plan(2), 1000, True) > base
+    # agentic (LLM-driven) run -> longer than the degraded single pass
+    agentic = estimate_search_seconds(_plan(2), 1000, True)
+    assert agentic > base
+    assert estimate_search_seconds(_plan(4), 1000, True) > agentic
+    # default-shaped searches must fit the <=3-minute budget envelope
+    assert estimate_search_seconds(_plan(3), 100_000, True) <= 180
     # charting -> longer, monotone in claim count
     one = estimate_search_seconds(_plan(2), 1000, False, charting_claims=1)
     two = estimate_search_seconds(_plan(2), 1000, False, charting_claims=2)
@@ -187,9 +195,9 @@ def test_humanize_seconds() -> None:
     assert "hours" in humanize_seconds(7200)
 
 
-# ------------------------------------------------------- invalidity pipeline
+# ------------------------------------------------ invalidity: degraded mode
 
-def test_invalidity_search_end_to_end_keys_free(target: Patent, store: BM25Store) -> None:
+def test_invalidity_degraded_keys_free(target: Patent, store: BM25Store) -> None:
     agent = InvaliditySearchAgent(keyword_store=store, llm=None)
     messages: list[str] = []
     result = agent.search(target, claims=[1], final_k=10, progress=messages.append)
@@ -203,17 +211,19 @@ def test_invalidity_search_end_to_end_keys_free(target: Patent, store: BM25Store
     assert "US9000001B2" not in numbers          # priority 2014 > 2008 cutoff
     assert "US7000003B1" in result.excluded["examiner_cited"]
     assert "US8123457A1" in result.excluded["family"]
-    # the genuinely relevant references made it through
+    # the genuinely relevant references made it through, sorted best-first
     assert "US7000001B1" in numbers
-    # every result carries highlighted passages
+    scores = [r["score"] for r in result.results]
+    assert scores == sorted(scores, reverse=True)
     for ranked in result.results:
         assert ranked["passages"], f"{ranked['patent_number']} has no passages"
-        assert all(p["text"] for p in ranked["passages"])
-    # date cutoff recorded in the executed params; LLM stage was skipped
+    # degraded mode is clearly labeled
+    assert result.plan_or_params["mode"] == "degraded_keyword_only"
     assert result.plan_or_params["before_date"] == "2008-04-10"
-    assert result.plan_or_params["llm_rerank"] is False
+    assert result.stop_reason == "degraded"
+    assert result.trace is None
     assert result.timing["total"] >= 0
-    assert any("stage 1" in m for m in messages)
+    assert any("degraded" in m for m in messages)
 
 
 def test_invalidity_examiner_exclusion_can_be_disabled(target: Patent, store: BM25Store) -> None:
@@ -224,30 +234,6 @@ def test_invalidity_examiner_exclusion_can_be_disabled(target: Patent, store: BM
     assert "examiner_cited" not in result.excluded
 
 
-def test_invalidity_stage3_llm_rerank_changes_order(target: Patent, store: BM25Store) -> None:
-    # Without an LLM, US7000001B1 outranks US7000002B1 on keywords alone.
-    keys_free = InvaliditySearchAgent(keyword_store=store, llm=None)
-    baseline = [r["patent_number"] for r in keys_free.search(target, claims=[1]).results]
-    assert baseline.index("US7000001B1") < baseline.index("US7000002B1")
-
-    # FakeLLM: first call returns keywords, second the stage-3 relevance scores.
-    llm = FakeLLM(responses=[
-        ["soil", "moisture", "sensor", "irrigation", "wireless"],
-        [
-            {"number": "US7000002B1", "score": 10, "why": "discloses every limitation"},
-            {"number": "US7000001B1", "score": 2, "why": "missing the controller"},
-        ],
-    ])
-    agent = InvaliditySearchAgent(keyword_store=store, llm=llm)
-    result = agent.search(target, claims=[1])
-    numbers = [r["patent_number"] for r in result.results]
-    assert numbers.index("US7000002B1") < numbers.index("US7000001B1"), \
-        "LLM stage-3 scores should reorder the ranking"
-    top = result.results[numbers.index("US7000002B1")]
-    assert top["why"] == "discloses every limitation"
-    assert result.plan_or_params["llm_rerank"] is True
-
-
 def test_file_wrapper_enrichment_failures_are_skipped(target: Patent, store: BM25Store) -> None:
     class ExplodingWrapper:
         def enrich_patent(self, patent):
@@ -255,7 +241,180 @@ def test_file_wrapper_enrichment_failures_are_skipped(target: Patent, store: BM2
 
     agent = InvaliditySearchAgent(keyword_store=store, llm=None, file_wrapper=ExplodingWrapper())
     result = agent.search(target, claims=[1])
-    assert result.results  # pipeline survives enrichment failure
+    assert result.results  # search survives enrichment failure
+
+
+def test_file_wrapper_enrichment_adds_examiner_exclusions(target: Patent,
+                                                          store: BM25Store) -> None:
+    class EnrichingWrapper:
+        def enrich_patent(self, patent):
+            enriched = patent.model_copy(deep=True)
+            enriched.citations.append(Citation(
+                patent_number=PatentNumber.parse("US7000002B1"), is_examiner=True))
+            return enriched
+
+    agent = InvaliditySearchAgent(keyword_store=store, llm=None,
+                                  file_wrapper=EnrichingWrapper())
+    result = agent.search(target, claims=[1], final_k=10)
+    assert "US7000002B1" in result.excluded["examiner_cited"]
+    assert "US7000002B1" not in [r["patent_number"] for r in result.results]
+
+
+# ------------------------------------------------- invalidity: agentic mode
+
+def agentic_script() -> list[dict]:
+    """Two search angles, a shortlist (with one bogus entry), then finish
+    (which also tries to sneak in an excluded number)."""
+    return [
+        {"text": "Trying the sensor-network angle first.",
+         "tool_calls": [{"name": "search_patents", "arguments": {
+             "keywords": ["soil", "moisture", "sensor", "wireless"], "limit": 10}}]},
+        # different keywords; targets the examiner-cited patent and tries to
+        # loosen the cutoff — both must be neutralized by the tool layer
+        {"tool_calls": [{"name": "search_patents", "arguments": {
+            "keywords": ["irrigation", "valve", "scheduling", "machine", "learning"],
+            "before_date": "2030-01-01", "limit": 10}}]},
+        {"tool_calls": [{"name": "shortlist", "arguments": {"candidates": [
+            {"number": "US7000001B1", "why": "mesh network nodes feed a controller"},
+            {"number": "US9999999B9", "why": "never appeared in any search"},
+        ]}}]},
+        {"tool_calls": [{"name": "finish", "arguments": {
+            "candidates": [
+                {"number": "US7000002B1", "why": "probe drives the controller",
+                 "confidence": 0.9, "key_passages": ["capacitive soil moisture probe"]},
+                {"number": "US7000001B1", "why": "wireless mesh sensor network",
+                 "confidence": 0.7},
+                {"number": "US7000003B1", "why": "examiner art (must be rejected)",
+                 "confidence": 0.99},
+            ],
+            "rationale": "both angles converged",
+            "suggested_next_queries": ["capacitive probe calibration"],
+        }}]},
+    ]
+
+
+def test_agentic_invalidity_end_to_end(target: Patent, store: BM25Store) -> None:
+    llm = FakeLLM(tool_script=agentic_script())
+    agent = InvaliditySearchAgent(keyword_store=store, llm=llm)
+    steps = []
+    result = agent.search(target, claims=[1], final_k=50, on_step=steps.append)
+
+    # ranked exactly as scripted (excluded sneak-in rejected), best first
+    numbers = [r["patent_number"] for r in result.results]
+    assert numbers == ["US7000002B1", "US7000001B1"]
+    assert result.results[0]["score"] == 0.9
+    assert result.results[1]["score"] == 0.7
+    # titles hydrated from the store; key passages preserved
+    assert result.results[0]["title"] == "Soil moisture probe for irrigation control"
+    assert result.results[0]["passages"][0]["text"] == "capacitive soil moisture probe"
+    assert result.results[0]["why"] == "probe drives the controller"
+    assert result.stop_reason == "finish_tool"
+    assert result.plan_or_params["mode"] == "agentic"
+    assert result.plan_or_params["suggested_next_queries"] == ["capacitive probe calibration"]
+    assert result.conversation, "agentic result must carry the resumable conversation"
+    assert steps, "on_step must receive trace steps"
+
+    # excluded numbers NEVER returned by the search tool, even when asked for
+    trace = result.trace
+    assert trace is not None
+    search_results = [s for s in trace.steps
+                      if s.kind == "tool_result" and s.tool_name == "search_patents"]
+    assert len(search_results) == 2
+    for step in search_results:
+        assert "US7000003B1" not in step.content   # examiner-cited
+        assert "US8123457A1" not in step.content   # family
+        assert "US8123456B2" not in step.content   # self
+        assert "US9000001B2" not in step.content   # post-cutoff (clamp held)
+    # the bogus shortlist entry was rejected; the valid one kept
+    assert trace.shortlist_history == [[{"number": "US7000001B1",
+                                         "why": "mesh network nodes feed a controller"}]]
+
+    # the markdown trace contains the queries the agent issued
+    markdown = trace.to_markdown()
+    assert "search_patents" in markdown
+    assert '"soil"' in markdown and '"wireless"' in markdown
+    assert '"valve"' in markdown and '"scheduling"' in markdown
+    assert "Queries issued" in markdown
+    json.dumps(trace.model_dump(mode="json"))  # trace is fully serializable
+
+
+def test_agentic_invalidity_truncated_run_falls_back_to_shortlist(
+        target: Patent, store: BM25Store) -> None:
+    llm = FakeLLM(tool_script=[
+        {"tool_calls": [{"name": "search_patents", "arguments": {
+            "keywords": ["soil", "moisture", "sensor"]}}]},
+        {"tool_calls": [{"name": "shortlist", "arguments": {"candidates": [
+            {"number": "US7000001B1", "why": "good", "key_passage": "mesh network"}]}}]},
+        {"tool_calls": [{"name": "search_patents", "arguments": {"keywords": ["probe"]}}]},
+        {"tool_calls": [{"name": "search_patents", "arguments": {"keywords": ["valve"]}}]},
+    ])
+    agent = InvaliditySearchAgent(keyword_store=store, llm=llm)
+    result = agent.search(target, claims=[1], max_steps=3)
+    assert result.stop_reason == "max_steps"
+    numbers = [r["patent_number"] for r in result.results]
+    assert numbers == ["US7000001B1"]  # the working shortlist
+    assert "shortlist" in result.plan_or_params["rationale"]
+
+
+def test_agentic_runner_requires_llm(store: BM25Store) -> None:
+    runner = AgenticSearchRunner(store, llm=None)
+    with pytest.raises(ValueError, match="requires an llm"):
+        runner.run("invalidity", exclusions={})
+
+
+def test_agentic_runner_rejects_unknown_search_type(store: BM25Store) -> None:
+    runner = AgenticSearchRunner(store, llm=FakeLLM(tool_script=[]))
+    with pytest.raises(ValueError, match="search_type"):
+        runner.run("bogus", exclusions={})
+
+
+# -------------------------------------------------------------- fto / infr.
+
+def test_fto_degraded_keys_free(store: BM25Store) -> None:
+    agent = FtoSearchAgent(keyword_store=store, llm=None)
+    result = agent.search("wireless soil moisture sensor for irrigation watering "
+                          "of garden zones", in_force_only=False, final_k=5)
+    assert result.results
+    assert result.plan_or_params["mode"] == "degraded_keyword_only"
+    assert result.stop_reason == "degraded"
+    assert result.requires_attorney_review is True
+
+
+def test_infringement_degraded_token_overlap(target: Patent) -> None:
+    agent = InfringementSearchAgent(llm=None)
+    result = agent.search(target, claims=[1], product_candidates=[
+        {"name": "SmartSprinkler", "description": "wireless soil moisture sensor "
+                                                  "nodes controlling watering of zones"},
+        {"name": "Toaster", "description": "browns bread"},
+    ])
+    assert result.results[0]["name"] == "SmartSprinkler"
+    assert result.results[0]["score"] > result.results[1]["score"]
+    assert "degraded" in result.results[0]["rationale"]
+    assert result.stop_reason == "degraded"
+
+
+def test_infringement_agentic_ranks_products(target: Patent) -> None:
+    llm = FakeLLM(tool_script=[
+        {"tool_calls": [{"name": "finish", "arguments": {
+            "candidates": [
+                {"number": "SmartSprinkler", "why": "practices every limitation",
+                 "confidence": 0.85},
+                {"number": "Toaster", "why": "no irrigation function", "confidence": 0.05},
+            ],
+            "rationale": "evidence review complete",
+        }}]},
+    ])
+    agent = InfringementSearchAgent(llm=llm)
+    result = agent.search(target, claims=[1], product_candidates=[
+        {"name": "SmartSprinkler", "description": "wireless watering controller",
+         "url": "https://example.com/ss"},
+        {"name": "Toaster", "description": "browns bread"},
+    ], evidence_texts=["datasheet: soil moisture nodes"])
+    assert [r["name"] for r in result.results] == ["SmartSprinkler", "Toaster"]
+    assert result.results[0]["url"] == "https://example.com/ss"
+    assert result.results[0]["score"] == 0.85
+    assert result.stop_reason == "finish_tool"
+    assert result.trace is not None
 
 
 # ----------------------------------------------------------------- guided
@@ -280,18 +439,20 @@ def test_guided_session_full_state_machine_round_trip(target: Patent, store: BM2
     fresh = SessionStore(tmp_path / "sessions")
     assert fresh.get(session.id) is not None
 
-    # plan feedback revises the plan in place
+    # plan feedback adjusts the preview and seeds the agent's guidance
     session = guided.apply_plan_feedback(restored, SearchFeedback(
         queries=[QueryFeedback(query_index=0, verdict="too_narrow", note="add synonyms")],
         free_text="cover mesh networking angles too",
     ))
     assert session.state == "awaiting_plan_feedback"
     assert len(session.feedback_history) == 1
+    assert any("mesh networking" in g for g in session.params["pre_run_guidance"])
 
     # execute -> results land on the session
     session = guided.execute(session)
     assert session.state == "awaiting_result_feedback"
     assert session.last_results
+    assert session.params["stop_reason"] == "degraded"
     first_numbers = [r["patent_number"] for r in session.last_results]
     assert "US7000003B1" not in first_numbers  # examiner-art exclusion holds
 
@@ -303,6 +464,7 @@ def test_guided_session_full_state_machine_round_trip(target: Patent, store: BM2
     assert session.state == "searching"
     assert session.iteration == 1
     assert victim in session.plan.exclusions
+    assert session.params["pending_feedback"], "feedback is queued for the agent"
 
     # serialize mid-loop and resume in a "new process"
     resumed = GuidedSearchSession.model_validate_json(session.model_dump_json())
@@ -314,6 +476,58 @@ def test_guided_session_full_state_machine_round_trip(target: Patent, store: BM2
     assert session.state == "done"
     with pytest.raises(ValueError):
         guided.execute(session)
+
+
+def test_guided_agentic_feedback_resumes_same_conversation(target: Patent,
+                                                           store: BM25Store) -> None:
+    llm = FakeLLM(tool_script=[
+        # --- first execution ---
+        {"tool_calls": [{"name": "search_patents", "arguments": {
+            "keywords": ["soil", "moisture", "sensor"]}}]},
+        {"tool_calls": [{"name": "finish", "arguments": {
+            "candidates": [{"number": "US7000001B1", "why": "mesh network",
+                            "confidence": 0.8}],
+            "rationale": "first pass"}}]},
+        # --- resumed execution after feedback ---
+        {"tool_calls": [{"name": "finish", "arguments": {
+            "candidates": [{"number": "US7000002B1", "why": "capacitive probe",
+                            "confidence": 0.9},
+                           {"number": "US7000001B1", "why": "mesh network",
+                            "confidence": 0.6}],
+            "rationale": "re-ranked per feedback"}}]},
+    ])
+    guided = GuidedSearch(keyword_store=store, llm=llm)
+    session = guided.start_with_patent("invalidity", target, claims=[1])
+    session = guided.execute(session)
+    assert [r["patent_number"] for r in session.last_results] == ["US7000001B1"]
+    assert session.params["stop_reason"] == "finish_tool"
+    assert session.params["conversation"], "conversation persisted for resumption"
+    first_convo_len = len(session.params["conversation"])
+    trace_summary_queries = session.params["trace"]["queries"]
+    assert trace_summary_queries and trace_summary_queries[0]["tool"] == "search_patents"
+
+    session = guided.apply_result_feedback(session, SearchFeedback(
+        results=[ResultFeedback(patent_number="US7000001B1", relevant=True,
+                                note="good but rank probes higher")],
+        free_text="prefer capacitive probe art",
+    ))
+    session = guided.execute(session)
+
+    # the second run RESUMED the same conversation (no fresh task message) ...
+    resumed_convo = llm.tool_conversations[-1]
+    assert len(resumed_convo) > first_convo_len - 1
+    texts = [b.get("text", "") for m in resumed_convo
+             for b in m["content"] if isinstance(b, dict)]
+    # ... the original task message is still its first message ...
+    assert any("Find prior art that invalidates US8123456B2" in t for t in texts)
+    # ... and the injected feedback message is present
+    assert any("USER FEEDBACK" in t and "capacitive probe art" in t for t in texts)
+    # results updated from the resumed run; US7000002B1 was seen in run 1's
+    # search results, so the reseeded validation accepts it
+    assert [r["patent_number"] for r in session.last_results] == \
+        ["US7000002B1", "US7000001B1"]
+    # the resumed run's trace records the feedback event
+    assert any("capacitive probe art" in f for f in session.params["trace"]["feedback"])
 
 
 def test_guided_start_requires_resolvable_patent(store: BM25Store) -> None:

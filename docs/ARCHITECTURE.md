@@ -40,13 +40,19 @@ minimum-match, fields, CPC art classes, inventors, assignees, date cutoffs,
 countries, allow/deny number lists, limit. Backends apply what they support;
 `apply_metadata_filters` gives in-memory backends the reference semantics.
 
-Staged retrieval (mirrors the production pipeline patentkit derives from):
+Agentic retrieval (`patentkit.agents.agentic`): one LLM agent on the
+provider's native tool-use platform (Anthropic Messages API tool use; OpenAI
+Responses API function tools) generates its own queries, executes them as
+tools (`search_patents`, `semantic_search`, `get_patent`, `shortlist`),
+reads the results, refines its angles, and calls `finish` with ranked
+candidates — under explicit step/wall-clock budgets (defaults finish in ≤3
+minutes), with a full saved reasoning trace (`SearchTrace`) and a resumable
+conversation for user-feedback injection. Without an LLM, the agents degrade
+to a single clearly-labeled BM25 pass so everything works keys-free.
 
-1. **Stage 1 — recall**: BM25/ES keyword search (k≈1000), prior-art date
-   cutoff, default exclusions.
-2. **Stage 2 — precision**: vector similarity + RRF fusion (k=60).
-3. **Stage 3 — LLM relevance**: batched scoring of top candidates against the
-   asserted claims; final score `0.75·llm + 0.25·retrieval` (z-normalized).
+Hard rules live in the tool layer, not the prompt: the exclusion list is
+always applied to search results / shortlist / finish, and the invalidity
+`before_date` is clamped to the prior-art cutoff.
 
 Default invalidity exclusions: the target patent, its family, examiner-cited
 art (from `Patent.citations` and, when available, the USPTO file wrapper), and

@@ -161,14 +161,17 @@ def test_guided_flow_through_dispatch(toolset: PatentToolset) -> None:
     assert executed["state"] == "awaiting_result_feedback"
     numbers = [r["patent_number"] for r in executed["results"]]
     assert numbers and "US7000003B1" not in numbers  # examiner-art exclusion default
+    assert executed["stop_reason"] == "degraded"     # keys-free mode, clearly labeled
     json.dumps(executed)
 
     status = dispatch(toolset, "guided_search_status", {"session_id": session_id})
     assert status["state"] == "awaiting_result_feedback"
     assert status["n_results"] == len(numbers)
     assert status["feedback_rounds"] == 1
+    assert status["stop_reason"] == "degraded"
+    assert status["elapsed_seconds"] is not None
 
-    # result feedback queues another iteration
+    # result feedback queues another iteration (injected on the next execute)
     again = dispatch(toolset, "guided_search_feedback", {
         "session_id": session_id,
         "feedback": {"results": [{"patent_number": numbers[0], "relevant": False}]},
@@ -180,6 +183,78 @@ def test_guided_flow_through_dispatch(toolset: PatentToolset) -> None:
 
 def test_guided_status_unknown_session(toolset: PatentToolset) -> None:
     out = dispatch(toolset, "guided_search_status", {"session_id": "nope"})
+    assert "error" in out
+
+
+# --------------------------------------------------------------- agent trace
+
+def test_get_search_trace_through_dispatch(tmp_path) -> None:
+    from tests.fakes import FakeLLM
+
+    store = BM25Store()
+    store.index([
+        make_patent(
+            "US8123456B2", "Sensor driven zone irrigation system",
+            "1. An irrigation system comprising wireless soil moisture sensor nodes "
+            "and a controller scheduling watering of zones.",
+            "Wireless soil moisture sensor nodes feed a zone irrigation controller.",
+            date(2008, 4, 10),
+        ),
+        make_patent(
+            "US7000001B1", "Wireless soil moisture sensor network",
+            "1. A soil moisture sensor node transmitting moisture readings over a "
+            "wireless mesh network to an irrigation controller.",
+            "Sensor nodes measure soil moisture and relay readings wirelessly to an "
+            "irrigation controller scheduling watering.",
+            date(2001, 3, 1),
+        ),
+    ])
+    llm = FakeLLM(tool_script=[
+        {"tool_calls": [{"name": "search_patents", "arguments": {
+            "keywords": ["soil", "moisture", "wireless"]}}]},
+        {"tool_calls": [{"name": "shortlist", "arguments": {"candidates": [
+            {"number": "US7000001B1", "why": "mesh sensor network"}]}}]},
+        {"tool_calls": [{"name": "finish", "arguments": {
+            "candidates": [{"number": "US7000001B1", "why": "mesh sensor network",
+                            "confidence": 0.8}],
+            "rationale": "done"}}]},
+    ])
+    toolset = PatentToolset(keyword_store=store, llm=llm,
+                            session_dir=str(tmp_path / "sessions"))
+
+    started = dispatch(toolset, "guided_search_start", {
+        "search_type": "invalidity", "patent_number": "US8123456B2", "claims": [1]})
+    session_id = started["session_id"]
+    executed = dispatch(toolset, "guided_search_execute", {"session_id": session_id})
+    assert executed["stop_reason"] == "finish_tool"
+    assert executed["trace_summary"]["step_count"] > 0
+    assert executed["trace_summary"]["queries_issued"]
+
+    trace = dispatch(toolset, "get_search_trace", {"session_id": session_id})
+    assert "error" not in trace
+    assert "search_patents" in trace["markdown"]
+    assert '"moisture"' in trace["markdown"]  # the issued query keywords
+    assert trace["queries"][0]["arguments"]["keywords"] == ["soil", "moisture", "wireless"]
+    assert trace["shortlist_history"] == [[{"number": "US7000001B1",
+                                            "why": "mesh sensor network"}]]
+    assert trace["stop_reason"] == "finish_tool"
+    assert trace["step_count"] > 0
+    json.dumps(trace)
+
+
+def test_get_search_trace_degraded_session_has_helpful_error(toolset: PatentToolset) -> None:
+    started = dispatch(toolset, "guided_search_start", {
+        "search_type": "invalidity", "patent_number": "US8123456B2"})
+    session_id = started["session_id"]
+    out = dispatch(toolset, "get_search_trace", {"session_id": session_id})
+    assert "error" in out and "no persisted trace" in out["error"]
+    dispatch(toolset, "guided_search_execute", {"session_id": session_id})
+    out = dispatch(toolset, "get_search_trace", {"session_id": session_id})
+    assert "error" in out  # degraded keys-free runs have no trace
+
+
+def test_get_search_trace_unknown_session(toolset: PatentToolset) -> None:
+    out = dispatch(toolset, "get_search_trace", {"session_id": "nope"})
     assert "error" in out
 
 

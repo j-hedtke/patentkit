@@ -1,6 +1,14 @@
-"""Agentic search workflows: planning, the 3-stage pipelines, charting, and
-the serializable guided loop driven by the MCP / OpenAI tool layers."""
+"""Agentic search workflows: the pure agentic search core (an LLM agent that
+generates and refines its own queries via tool use), the thin invalidity /
+FTO / infringement wrappers around it, claim charting, and the serializable
+guided loop driven by the MCP / OpenAI tool layers."""
 
+from patentkit.agents.agentic import (
+    AgenticCandidate,
+    AgenticSearchOutcome,
+    AgenticSearchRunner,
+    SearchTrace,
+)
 from patentkit.agents.charting import ChartingResult, InvalidityChartingAgent
 from patentkit.agents.feedback import (
     PassageFeedback,
@@ -34,6 +42,10 @@ from patentkit.agents.planner import (
 )
 
 __all__ = [
+    "AgenticCandidate",
+    "AgenticSearchOutcome",
+    "AgenticSearchRunner",
+    "SearchTrace",
     "ChartingResult",
     "InvalidityChartingAgent",
     "PassageFeedback",

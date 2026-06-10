@@ -23,9 +23,9 @@ Extras: `anthropic`, `openai`, `elasticsearch`, `docx`, `pdf`, `viz`, `mcp`, `sc
   `low` / `medium` / `high` effort, not model ids. Defaults: Claude Haiku 4.5 /
   Sonnet 4.6 / Fable 5 (Anthropic) and gpt-5-mini / gpt-5.1 (OpenAI), all
   overridable in one place (`patentkit.llm.DEFAULT_MODELS`).
-- **Everything degrades gracefully.** The whole pipeline runs offline with the
-  in-memory BM25 store and no LLM key (LLM stages are skipped); add keys and
-  backends to turn quality up.
+- **Everything degrades gracefully.** Everything runs offline with the
+  in-memory BM25 store and no LLM key (searches fall back to a clearly-labeled
+  single keyword pass); add keys and backends to turn quality up.
 - **One canonical data model.** Every source parses into
   `patentkit.models.Patent`; `Patent.merge()` reconciles records from multiple
   sources with per-source fidelity and provenance (`sources`).
@@ -89,16 +89,18 @@ result = agent.search(patent, claims=[1])
 
 The guided flow is what the Claude skills / OpenAI tools drive:
 
-1. `guided_search_start` — an LLM drafts a **search plan**: a series of
-   queries with purposes, art classes, include/exclude tokens, date cutoffs,
-   plus an **estimated completion time**.
-2. The user reviews the plan; feedback on whole results, individual passages,
-   or individual queries is structured (`patentkit.agents.feedback`).
-3. `guided_search_execute` — runs the staged pipeline (keyword → hybrid
-   rerank → LLM relevance), returning ranked results with **highlighted
-   relevant passages**. Examiner-cited art from the file wrapper, family
-   members, and the target itself are excluded by default (overridable).
-4. `guided_search_feedback` — revises the plan and iterates.
+1. `guided_search_start` — derives a **plan preview** (the starting query
+   angles, exclusions, date cutoff) plus an **estimated completion time**.
+2. The user reviews the preview; feedback on whole results, individual
+   passages, or individual queries is structured (`patentkit.agents.feedback`).
+3. `guided_search_execute` — runs the **agentic search**: one LLM agent
+   iteratively generates queries, executes them as tools, reads the results,
+   refines, and finishes with ranked candidates — under a time budget, with a
+   full saved reasoning trace (`get_search_trace`). Examiner-cited art from
+   the file wrapper, family members, and the target itself are excluded by
+   default at the tool layer (overridable).
+4. `guided_search_feedback` — queued and injected into the SAME resumed agent
+   conversation on the next execute; iterate until satisfied.
 
 Sessions are JSON-serializable, so the loop works across chat turns in any
 agent harness.

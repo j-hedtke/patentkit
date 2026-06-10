@@ -48,6 +48,20 @@ def _result_dict(result: SearchResult) -> dict:
     }
 
 
+def _trace_summary(session: GuidedSearchSession) -> Optional[dict]:
+    """Compact summary of the persisted agent trace, when one exists."""
+    trace = session.params.get("trace")
+    if not trace:
+        return None
+    return {
+        "step_count": len(trace.get("steps", [])),
+        "queries_issued": [q.get("arguments") for q in trace.get("queries", [])],
+        "shortlist": (trace.get("shortlist_history") or [[]])[-1],
+        "stop_reason": trace.get("stop_reason"),
+        "elapsed_s": trace.get("elapsed_s"),
+    }
+
+
 def _session_dict(session: GuidedSearchSession) -> dict:
     return {
         "session_id": session.id,
@@ -58,6 +72,9 @@ def _session_dict(session: GuidedSearchSession) -> dict:
         "estimated_seconds": session.params.get("estimated_seconds"),
         "estimated_human": session.params.get("estimated_human"),
         "n_results": len(session.last_results),
+        "stop_reason": session.params.get("stop_reason"),
+        "elapsed_seconds": session.params.get("elapsed_seconds"),
+        "trace_summary": _trace_summary(session),
     }
 
 
@@ -224,9 +241,10 @@ class PatentToolset:
         """Start a guided patent search session. search_type is 'invalidity'
         (prior art against a patent — needs patent_number), 'fto' (freedom to
         operate — needs product_description), or 'infringement' (needs
-        patent_number). Returns a session_id, the proposed search plan, and
-        an up-front time estimate; present the plan to the user and collect
-        feedback before executing."""
+        patent_number). Returns a session_id, a preview of the starting query
+        angles (the executing agent generates and refines its own queries),
+        and an up-front time estimate; present the preview to the user and
+        collect feedback before executing."""
         try:
             session = self.guided.start(
                 search_type, target_patent_number=patent_number,  # type: ignore[arg-type]
@@ -242,8 +260,10 @@ class PatentToolset:
         'queries' ([{query_index, verdict: good|too_broad|too_narrow|off_topic,
         note}]), 'results' ([{patent_number, relevant, note}]), 'passages'
         ([{patent_number, passage_text, relevant, note}]), and 'free_text'.
-        Plan feedback revises the plan; result feedback queues a refined
-        iteration. Returns the updated session state and plan."""
+        Before execution it adjusts the plan preview and seeds the agent's
+        initial guidance; after execution it is queued and injected as a user
+        message when the SAME agent conversation resumes (irrelevant results
+        also become hard exclusions). Returns the updated session state."""
         try:
             session = self._require_session(session_id)
             parsed = SearchFeedback.model_validate(feedback)
@@ -256,10 +276,14 @@ class PatentToolset:
         return _session_dict(session)
 
     def guided_search_execute(self, session_id: str) -> dict:
-        """Execute the current plan of a guided session (runs the invalidity /
-        FTO / infringement agent). Returns ranked results with highlighted
-        passages, exclusions applied, and timing. May take the estimated time
-        reported by guided_search_start."""
+        """Execute (or resume) a guided session's agentic search: one LLM
+        agent issues and refines its own queries via tool use under a time
+        budget; queued feedback is injected into the resumed conversation.
+        Returns ranked results, what was excluded and why, timing, the stop
+        reason, and a trace summary (use get_search_trace for the full
+        reasoning trace). May take the estimated time reported by
+        guided_search_start. Without an LLM it runs a clearly-labeled
+        degraded single keyword pass."""
         try:
             session = self._require_session(session_id)
             session = self.guided.execute(session)
@@ -279,8 +303,10 @@ class PatentToolset:
         return out
 
     def guided_search_status(self, session_id: str) -> dict:
-        """Get the state of a guided session: its plan, iteration count, time
-        estimate, and last results summary."""
+        """Get the state of a guided session: its plan preview, iteration
+        count, time estimate, last results, stop reason, elapsed time, and a
+        trace summary (step count, queries issued so far, the agent's
+        intermediate shortlist)."""
         try:
             session = self._require_session(session_id)
         except LookupError as exc:
@@ -289,6 +315,30 @@ class PatentToolset:
         out["results"] = session.last_results
         out["feedback_rounds"] = len(session.feedback_history)
         return out
+
+    def get_search_trace(self, session_id: str) -> dict:
+        """Get the full reasoning trace of a guided session's last agentic
+        execution: the human-readable markdown trace, every query the agent
+        issued, and the shortlist evolution. Show this to the user so they
+        can give feedback on specific queries and results."""
+        try:
+            session = self._require_session(session_id)
+        except LookupError as exc:
+            return {"error": str(exc)}
+        trace = GuidedSearch.session_trace(session)
+        if trace is None:
+            return {"error": f"Session {session_id} has no persisted trace yet "
+                             "(execute it first; degraded keys-free runs have no trace)."}
+        return {
+            "session_id": session_id,
+            "markdown": trace.to_markdown(),
+            "queries": trace.queries,
+            "shortlist_history": trace.shortlist_history,
+            "feedback": trace.feedback,
+            "stop_reason": trace.stop_reason,
+            "elapsed_s": trace.elapsed_s,
+            "step_count": len(trace.steps),
+        }
 
     def estimate_search_time(self, search_type: str = "invalidity", n_queries: int = 4,
                              corpus_size: Optional[int] = None,
@@ -519,12 +569,14 @@ TOOL_SPECS: list[dict] = [
     ),
     _spec(
         "guided_search_start",
-        "Start a guided patent search session ('invalidity' needs "
+        "Start a guided agentic patent search session ('invalidity' needs "
         "patent_number; 'fto' needs product_description; 'infringement' needs "
-        "patent_number). Returns a session_id, a proposed multi-query search "
-        "plan, and an up-front time estimate. Present the plan (and estimate) "
-        "to the user and collect feedback before executing. Invalidity "
-        "searches exclude examiner-cited art and family members by default.",
+        "patent_number). Returns a session_id, a preview of the starting "
+        "query angles (the executing LLM agent generates and refines its own "
+        "queries at run time), and an up-front time estimate. Present the "
+        "preview (and estimate) to the user and collect feedback before "
+        "executing. Invalidity searches exclude examiner-cited art and "
+        "family members by default — enforced at the tool layer.",
         {
             "search_type": {"type": "string", "enum": ["invalidity", "fto", "infringement"],
                             "description": "Which search workflow to run."},
@@ -536,10 +588,12 @@ TOOL_SPECS: list[dict] = [
     ),
     _spec(
         "guided_search_feedback",
-        "Apply user feedback to a guided session. Before execution it revises "
-        "the plan; after execution it queues a refined iteration (irrelevant "
-        "results become exclusions, query verdicts adjust breadth). Returns "
-        "the updated state and plan.",
+        "Apply user feedback to a guided session — on the agent's queries "
+        "and/or its results. Before execution it adjusts the plan preview "
+        "and seeds the agent's initial guidance; after execution it is "
+        "queued and injected as a user message when the SAME agent "
+        "conversation resumes (irrelevant results also become hard "
+        "exclusions enforced at the tool layer). Returns the updated state.",
         {
             "session_id": {"type": "string", "description": "Session id from guided_search_start."},
             "feedback": _FEEDBACK_SCHEMA,
@@ -548,26 +602,40 @@ TOOL_SPECS: list[dict] = [
     ),
     _spec(
         "guided_search_execute",
-        "Execute the current plan of a guided session: runs the 3-stage "
-        "invalidity pipeline (keyword -> semantic rerank -> LLM scoring), the "
-        "FTO screen, or the infringement candidate ranking. Returns ranked "
-        "results with highlighted passages, what was excluded and why, and "
-        "per-stage timing.",
+        "Execute (or resume) a guided session's agentic search: one LLM "
+        "agent iteratively generates queries, runs them as tools, reads the "
+        "results, refines, and finishes with ranked candidates — under a "
+        "step/wall-clock budget, with a full saved reasoning trace. Queued "
+        "feedback is injected into the resumed conversation. Returns ranked "
+        "results, what was excluded and why, timing, stop_reason, and a "
+        "trace summary (full trace via get_search_trace).",
         {"session_id": {"type": "string", "description": "Session id from guided_search_start."}},
         ["session_id"],
     ),
     _spec(
         "guided_search_status",
-        "Get the state of a guided session: plan, iteration, time estimate, "
-        "feedback rounds, and the latest ranked results.",
+        "Get the state of a guided session: plan preview, iteration, time "
+        "estimate, feedback rounds, the latest ranked results, stop_reason, "
+        "elapsed time, and a trace summary (step count, queries issued, the "
+        "agent's intermediate shortlist).",
+        {"session_id": {"type": "string", "description": "Session id from guided_search_start."}},
+        ["session_id"],
+    ),
+    _spec(
+        "get_search_trace",
+        "Get the full reasoning trace of a guided session's last agentic "
+        "execution: a human-readable markdown trace, every query the agent "
+        "issued, and the shortlist evolution. Show it to the user to collect "
+        "feedback on specific queries and results.",
         {"session_id": {"type": "string", "description": "Session id from guided_search_start."}},
         ["session_id"],
     ),
     _spec(
         "estimate_search_time",
-        "Estimate how long a search will take before running it (per-query "
-        "base + corpus-size factor + LLM rerank latency + per-claim charting "
-        "cost). Returns seconds and a human-readable duration.",
+        "Estimate how long a search will take before running it (agentic "
+        "model: expected agent steps x per-step latency, plus a corpus-size "
+        "factor and per-claim charting cost). Returns seconds and a "
+        "human-readable duration.",
         {
             "search_type": {"type": "string", "enum": ["invalidity", "fto", "infringement"],
                             "default": "invalidity"},

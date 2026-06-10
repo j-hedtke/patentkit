@@ -7,16 +7,24 @@ layers can drive it across conversation turns:
     planning -> awaiting_plan_feedback -> searching ->
     awaiting_result_feedback -> (searching ...) -> done
 
+Execution runs the agentic search core: one LLM agent conversation issues
+and refines its own queries under step/wall-clock budgets. The session
+persists the agent's reasoning trace and the resumable conversation, so
+result-stage feedback is NOT a plan rewrite — it is queued and injected as a
+user message when execution resumes the SAME agent conversation. Plan-stage
+feedback (before the first execution) heuristically adjusts the pre-run
+preview and seeds the agent's initial guidance.
+
 Typical flow::
 
     guided = GuidedSearch(keyword_store=store, llm=get_llm("high"))
     session = guided.start("invalidity", target_patent_number="US10123456B2")
     # ... show session.plan + estimated time, collect SearchFeedback ...
     session = guided.apply_plan_feedback(session, feedback)
-    session = guided.execute(session)          # runs the right agent
-    # ... show session.last_results, collect feedback ...
+    session = guided.execute(session)          # runs the agent
+    # ... show session.last_results + trace, collect feedback ...
     session = guided.apply_result_feedback(session, feedback)
-    session = guided.execute(session)          # next iteration
+    session = guided.execute(session)          # resumes the SAME conversation
     session = guided.finish(session)
 """
 
@@ -31,6 +39,7 @@ from typing import Callable, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from patentkit.agents.agentic import SearchTrace
 from patentkit.agents.feedback import SearchFeedback
 from patentkit.agents.fto_search import FtoSearchAgent
 from patentkit.agents.infringement_search import InfringementSearchAgent
@@ -43,7 +52,6 @@ from patentkit.agents.planner import (
     revise_plan,
 )
 from patentkit.models import Patent, PatentNumber
-from patentkit.search.base import SearchQuery
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +63,13 @@ SessionState = Literal[
 class GuidedSearchSession(BaseModel):
     """Serializable state of one guided search.
 
-    ``params`` carries everything execution needs (the target patent as a
-    JSON dump, claim selection, product description, time estimates, and the
-    last full agent result), so a session restored from JSON in a later
-    process is fully executable.
+    ``params`` carries everything execution needs — the target patent as a
+    JSON dump, claim selection, product description, time estimates, the
+    last full agent result, the agent's reasoning trace
+    (``params["trace"]``), the resumable agent conversation
+    (``params["conversation"]``), and queued feedback messages
+    (``params["pending_feedback"]``) — so a session restored from JSON in a
+    later process is fully executable and resumable.
     """
 
     id: str
@@ -104,13 +115,14 @@ class SessionStore:
 
 
 class GuidedSearch:
-    """Drives guided sessions: plan -> feedback -> execute -> iterate.
+    """Drives guided sessions: plan preview -> feedback -> agentic execution.
 
     Args:
         keyword_store: keyword store searched by the agents.
-        vector_store: optional vector store for semantic reranking.
-        llm: optional LLM used for planning, revision, and stage-3 scoring;
-            ``None`` runs everything in keys-free degraded mode.
+        vector_store: optional vector store (adds the agent's
+            ``semantic_search`` tool).
+        llm: optional LLM driving the agent; ``None`` runs everything in
+            keys-free degraded mode (single keyword pass per execution).
         session_store: optional :class:`SessionStore`; sessions are saved
             into it after every transition when provided.
     """
@@ -159,7 +171,7 @@ class GuidedSearch:
         """Create a session and plan it; state becomes awaiting_plan_feedback.
 
         Args:
-            search_type: which agent will execute the plan.
+            search_type: which agent will execute the search.
             target_patent_number: target patent (invalidity / infringement);
                 resolved via ``fetch``, then the keyword store, then the
                 Google Patents connector.
@@ -181,7 +193,11 @@ class GuidedSearch:
         product_description: Optional[str] = None,
         claims: Optional[list[int]] = None,
     ) -> GuidedSearchSession:
-        """Like :meth:`start` but with an already-resolved :class:`Patent`."""
+        """Like :meth:`start` but with an already-resolved :class:`Patent`.
+
+        The plan preview is derived deterministically (no LLM call), so
+        starting a session is instant.
+        """
         plan = plan_search(search_type, patent=patent,
                            product_description=product_description, claims=claims, llm=self.llm)
         corpus = len(self.keyword_store) if self.keyword_store is not None else 0
@@ -199,6 +215,8 @@ class GuidedSearch:
                 "product_description": product_description,
                 "estimated_seconds": estimated,
                 "estimated_human": humanize_seconds(estimated),
+                "pending_feedback": [],
+                "pre_run_guidance": [],
             },
         )
         return self._save(session)
@@ -206,22 +224,36 @@ class GuidedSearch:
     # -------------------------------------------------------------- feedback
     def apply_plan_feedback(self, session: GuidedSearchSession,
                             feedback: SearchFeedback) -> GuidedSearchSession:
-        """Revise the plan from feedback; stays in awaiting_plan_feedback so
-        the user can review the revision (or call :meth:`execute` directly)."""
+        """Apply pre-run feedback: heuristically adjust the plan preview and
+        seed the agent's initial guidance. Stays in awaiting_plan_feedback so
+        the user can review (or call :meth:`execute` directly)."""
         if session.plan is None:
             raise ValueError(f"Session {session.id} has no plan to revise")
-        session.plan = revise_plan(session.plan, feedback, llm=self.llm)
+        session.plan = revise_plan(session.plan, feedback)
         session.feedback_history.append(feedback)
+        guidance = session.params.setdefault("pre_run_guidance", [])
+        guidance.append(feedback.summary_for_llm())
         session.state = "awaiting_plan_feedback"
         return self._save(session)
 
     def apply_result_feedback(self, session: GuidedSearchSession,
                               feedback: SearchFeedback) -> GuidedSearchSession:
-        """Revise the plan from result feedback and queue another iteration."""
+        """Queue result feedback for injection into the resumed agent
+        conversation, and queue another iteration.
+
+        No plan rewrite / LLM call happens here: the feedback summary is
+        injected as a user message when :meth:`execute` resumes the SAME
+        conversation. Results marked irrelevant additionally become hard
+        exclusions enforced at the tool layer (and in degraded mode).
+        """
         if session.plan is None:
-            raise ValueError(f"Session {session.id} has no plan to revise")
-        session.plan = revise_plan(session.plan, feedback, llm=self.llm)
+            raise ValueError(f"Session {session.id} has no plan; call start() first")
         session.feedback_history.append(feedback)
+        pending = session.params.setdefault("pending_feedback", [])
+        pending.append(feedback.summary_for_llm())
+        for result in feedback.results:  # hard exclusions, enforced at the tool layer
+            if result.relevant is False and result.patent_number not in session.plan.exclusions:
+                session.plan.exclusions.append(result.patent_number)
         session.iteration += 1
         session.state = "searching"
         return self._save(session)
@@ -229,13 +261,15 @@ class GuidedSearch:
     # --------------------------------------------------------------- execute
     def execute(self, session: GuidedSearchSession,
                 progress: Optional[Callable[[str], None]] = None) -> GuidedSearchSession:
-        """Run the right agent for the session's plan.
+        """Run (or resume) the agentic search for this session.
 
-        The plan's queries are folded into one extra :class:`SearchQuery`
-        (keyword/required/excluded/art-class union, earliest before_date) so
-        complementary angles widen stage-1 recall; the plan's exclusions are
-        applied as custom exclusions. Results land in ``session.last_results``
-        and the full agent result model in ``session.params["result"]``.
+        First execution starts a fresh agent conversation seeded with the
+        plan's starting angles and any pre-run guidance; later executions
+        resume the persisted conversation with the queued feedback messages
+        injected. The reasoning trace lands in ``session.params["trace"]``,
+        the resumable conversation in ``session.params["conversation"]``,
+        ranked results in ``session.last_results``, and the full agent
+        result model in ``session.params["result"]``.
         """
         if session.plan is None:
             raise ValueError(f"Session {session.id} has no plan; call start() first")
@@ -249,35 +283,47 @@ class GuidedSearch:
             session.plan, corpus_size=corpus, with_llm_rerank=self.llm is not None)
         session.params["estimated_human"] = humanize_seconds(session.params["estimated_seconds"])
 
-        extra = self._fold_plan_queries(session.plan)
         patent = self._session_patent(session)
+        feedback_messages = self._drain_feedback(session)
+        resume = session.params.get("conversation") or None
 
         if session.search_type == "invalidity":
             if patent is None:
                 raise ValueError("Invalidity search needs a target patent")
             agent = InvaliditySearchAgent(self.keyword_store, self.vector_store, self.llm)
             result = agent.search(
-                patent, claims=session.params.get("claims"), extra_query=extra,
-                custom_exclusions=session.plan.exclusions, progress=progress,
+                patent, claims=session.params.get("claims"),
+                custom_exclusions=session.plan.exclusions,
+                feedback_messages=feedback_messages, resume_messages=resume,
+                progress=progress,
             )
         elif session.search_type == "fto":
             description = session.params.get("product_description")
             if not description:
                 raise ValueError("FTO search needs a product_description")
             agent = FtoSearchAgent(self.keyword_store, self.vector_store, self.llm)
-            result = agent.search(description, extra_query=extra, progress=progress)
+            result = agent.search(
+                description, custom_exclusions=session.plan.exclusions,
+                feedback_messages=feedback_messages, resume_messages=resume,
+                progress=progress,
+            )
         else:  # infringement
             if patent is None:
                 raise ValueError("Infringement search needs a target patent")
-            agent = InfringementSearchAgent(self.llm)
+            agent = InfringementSearchAgent(self.llm, keyword_store=self.keyword_store)
             result = agent.search(
                 patent, claims=session.params.get("claims"),
                 product_candidates=session.params.get("product_candidates"),
+                feedback_messages=feedback_messages, resume_messages=resume,
                 progress=progress,
             )
 
         session.last_results = result.results
-        session.params["result"] = result.model_dump(mode="json")
+        dump = result.model_dump(mode="json")
+        session.params["conversation"] = dump.pop("conversation", None)
+        session.params["trace"] = dump.get("trace")
+        session.params["result"] = dump
+        session.params["stop_reason"] = result.stop_reason
         session.params["elapsed_seconds"] = round(time.monotonic() - t0, 3)
         session.state = "awaiting_result_feedback"
         return self._save(session)
@@ -289,20 +335,32 @@ class GuidedSearch:
 
     # -------------------------------------------------------------- helpers
     @staticmethod
+    def _drain_feedback(session: GuidedSearchSession) -> list[str]:
+        """Consume queued pre-run guidance + result feedback for injection."""
+        messages: list[str] = []
+        if not session.params.get("conversation"):
+            # first run: seed the agent with the plan's angles + plan feedback
+            plan = session.plan
+            if plan is not None and plan.queries:
+                angles = "; ".join(
+                    f"{q.purpose}: {', '.join(q.query.keywords[:8])}" for q in plan.queries)
+                messages.append("Suggested starting angles (from the reviewed plan): " + angles)
+            messages += session.params.get("pre_run_guidance") or []
+            session.params["pre_run_guidance"] = []
+        messages += session.params.get("pending_feedback") or []
+        session.params["pending_feedback"] = []
+        return messages
+
+    @staticmethod
     def _session_patent(session: GuidedSearchSession) -> Optional[Patent]:
         dump = session.params.get("patent")
         return Patent.model_validate(dump) if dump else None
 
     @staticmethod
-    def _fold_plan_queries(plan: SearchPlan) -> Optional[SearchQuery]:
-        """Union the plan's queries into one extra SearchQuery for the agents."""
-        if not plan.queries:
-            return None
-        folded = plan.queries[0].query.to_search_query()
-        for planned in plan.queries[1:]:
-            from patentkit.agents._support import merge_query  # local helper
-            folded = merge_query(folded, planned.query.to_search_query())
-        return folded
+    def session_trace(session: GuidedSearchSession) -> Optional[SearchTrace]:
+        """The persisted reasoning trace of the last execution, if any."""
+        dump = session.params.get("trace")
+        return SearchTrace.model_validate(dump) if dump else None
 
 
 def restore_session(payload: str | dict) -> GuidedSearchSession:

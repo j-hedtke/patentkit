@@ -155,6 +155,11 @@ def html_to_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "template"]):
         tag.decompose()
-    text = soup.get_text(separator="\n")
+    # Break lines at block-level tags only (matching the stdlib fallback),
+    # so inline markup like <b>/<i> does not split words across lines.
+    for tag in soup.find_all(_BLOCK_TAGS):
+        tag.insert_before("\n")
+        tag.insert_after("\n")
+    text = soup.get_text()
     lines = [" ".join(line.split()) for line in text.splitlines()]
     return "\n".join(line for line in lines if line).strip()

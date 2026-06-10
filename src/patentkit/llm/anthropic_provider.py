@@ -2,10 +2,35 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 from patentkit.config import resolve_key
 from patentkit.llm.base import LLM, ChatMessage, LLMResponse
+from patentkit.llm.tools import ToolCall, ToolDef, ToolRound
+
+
+def _to_anthropic_messages(messages: list[dict]) -> list[dict]:
+    """Translate the neutral message schema into Anthropic content blocks."""
+    out: list[dict] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            out.append({"role": message["role"], "content": content})
+            continue
+        blocks: list[dict] = []
+        for block in content or []:
+            kind = block.get("type")
+            if kind == "text":
+                blocks.append({"type": "text", "text": block["text"]})
+            elif kind == "tool_call":
+                blocks.append({"type": "tool_use", "id": block["id"],
+                               "name": block["name"], "input": block.get("arguments") or {}})
+            elif kind == "tool_result":
+                blocks.append({"type": "tool_result",
+                               "tool_use_id": block["tool_call_id"],
+                               "content": block.get("content", "")})
+        out.append({"role": message["role"], "content": blocks})
+    return out
 
 
 class AnthropicLLM(LLM):
@@ -37,4 +62,30 @@ class AnthropicLLM(LLM):
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
             raw=response,
+        )
+
+    def run_tools(self, messages: list[dict], *, system: str | None = None,
+                  tools: Sequence[ToolDef] = (), max_tokens: int = 4096) -> ToolRound:
+        """One Messages-API tool-use round over the neutral conversation."""
+        client = self._client()
+        kwargs = dict(
+            model=self.model,
+            max_tokens=max_tokens,
+            messages=_to_anthropic_messages(messages),
+            tools=[{"name": t.name, "description": t.description,
+                    "input_schema": t.input_schema} for t in tools],
+        )
+        if system:
+            kwargs["system"] = system
+        response = client.messages.create(**kwargs)
+        text = "".join(b.text for b in response.content if b.type == "text")
+        calls = [
+            ToolCall(id=b.id, name=b.name, arguments=dict(b.input or {}))
+            for b in response.content if b.type == "tool_use"
+        ]
+        return ToolRound(
+            text=text,
+            tool_calls=calls,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
         )

@@ -11,3 +11,4 @@ build/
 *.docx
 !tests/fixtures/**/*.docx
 .DS_Store
+data/

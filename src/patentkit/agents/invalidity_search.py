@@ -1,21 +1,21 @@
-"""Three-stage invalidity (prior-art) search agent.
+"""Agentic invalidity (prior-art) search.
 
-A clean reimplementation of the production pipeline:
+With an LLM configured, the search is run by ONE agent conversation on the
+provider's native tool-use platform (:class:`~patentkit.agents.agentic.
+AgenticSearchRunner`): the model generates keyword queries itself, executes
+them as tools, reads the results, refines its angles, and decides when to
+stop — under explicit step/wall-clock budgets, with a full saved reasoning
+trace and resumable conversation for user-feedback injection.
 
-- **stage 1** — broad keyword search (k=1000) with the prior-art date cutoff
-  (``before_date = patent.best_effective_date()``) and examiner-art / family /
-  self exclusions applied up front;
-- **stage 2** — semantic rerank: when a vector store is configured the
-  keyword and vector rankings are fused with reciprocal-rank fusion
-  (``patentkit.search.hybrid.rrf_fuse`` when installed, else a local copy);
-- **stage 3** — LLM relevance scoring (only when an LLM is configured): one
-  batched JSON call scores each candidate 0-10 against the target claims,
-  combined as ``0.75 * llm + 0.25 * normalized stage-2 score`` (mirroring the
-  production 0.75 disclosure / 0.25 keyword weighting).
+The tool layer (not the prompt) enforces the invalidity ground rules: the
+prior-art cutoff (``before_date`` clamped to the target's earliest
+priority/filing date) and the default exclusions (examiner-cited art — with
+best-effort file-wrapper enrichment, family members, the target itself, and
+any custom numbers).
 
-Every stage degrades gracefully: with no vector store stage 2 keeps the
-keyword ranking; with no LLM stage 3 is skipped — the agent always works
-keys-free.
+Without an LLM the agent degrades to a SINGLE plain BM25 keyword pass with
+the same exclusions — clearly labeled ``mode="degraded_keyword_only"`` in
+the result — so the toolkit keeps working keys-free.
 """
 
 from __future__ import annotations
@@ -26,22 +26,21 @@ from typing import Callable, Optional, Sequence
 
 from pydantic import BaseModel, Field
 
-from patentkit.agents._support import (
-    combine_scores,
-    fuse_rankings,
-    llm_relevance_scores,
-    merge_query,
-    report_progress,
-    result_to_dict,
+from patentkit.agents._support import report_progress, result_to_dict
+from patentkit.agents.agentic import (
+    DEFAULT_BUDGET_SECONDS,
+    DEFAULT_MAX_STEPS,
+    AgenticCandidate,
+    AgenticSearchOutcome,
+    AgenticSearchRunner,
+    SearchTrace,
 )
 from patentkit.agents.planner import _fallback_keywords
+from patentkit.llm.tools import TraceStep
 from patentkit.models import Patent, PatentNumber
-from patentkit.search.base import KeywordStore, SearchQuery, SearchResult, VectorStore
+from patentkit.search.base import KeywordStore, SearchQuery, VectorStore
 
 logger = logging.getLogger(__name__)
-
-#: stage-1 breadth, matching the production pipeline's k=1000
-STAGE1_K = 1000
 
 
 class InvaliditySearchResult(BaseModel):
@@ -49,29 +48,61 @@ class InvaliditySearchResult(BaseModel):
 
     target: str
     claims: list[int] = Field(default_factory=list)
-    #: the query parameters / plan actually executed (for reproducibility)
+    #: the run parameters actually applied (cutoff, budgets, mode)
     plan_or_params: dict = Field(default_factory=dict)
-    #: ranked references: {patent_number, title, score, passages, why}
+    #: ranked references, best first:
+    #: {patent_number, title, score (=confidence 0-1), passages, why}
     results: list[dict] = Field(default_factory=list)
     #: exclusion reason -> patent numbers excluded for that reason
     excluded: dict[str, list[str]] = Field(default_factory=dict)
-    #: per-stage wall-clock seconds
     timing: dict[str, float] = Field(default_factory=dict)
+    #: full reasoning trace (agentic mode) — queries issued, tool results,
+    #: shortlist evolution; None in degraded keys-free mode
+    trace: Optional[SearchTrace] = None
+    #: why the agent stopped: finish_tool | end_turn | max_steps |
+    #: budget_exceeded | error | degraded
+    stop_reason: Optional[str] = None
+    #: neutral-schema agent conversation; pass back as ``resume_messages``
+    #: (with ``feedback_messages``) to continue the SAME agent run
+    conversation: Optional[list[dict]] = None
+
+
+def candidates_to_result_dicts(candidates: list[AgenticCandidate]) -> list[dict]:
+    """Map agent candidates to the public result-dict shape, best first."""
+    return [
+        {
+            "patent_number": c.number,
+            "title": c.title,
+            "score": round(c.confidence, 4),
+            "passages": [{"text": p, "field": "agent", "score": round(c.confidence, 4)}
+                         for p in c.passages],
+            "why": c.why or None,
+        }
+        for c in candidates
+    ]
+
+
+def step_summary(step: TraceStep) -> str:
+    """One-line human-readable rendering of a trace step (for progress UIs)."""
+    if step.kind == "tool_call":
+        return f"agent -> {step.tool_name}: {step.content[:160]}"
+    if step.kind == "tool_result":
+        return f"{step.tool_name} -> {step.content[:160]}"
+    return f"{step.kind}: {step.content[:160]}"
 
 
 class InvaliditySearchAgent:
-    """Runs the 3-stage invalidity pipeline against pluggable stores.
+    """Pure agentic prior-art search over pluggable stores.
 
     Args:
         keyword_store: any :class:`~patentkit.search.base.KeywordStore`.
-        vector_store: optional :class:`~patentkit.search.base.VectorStore`
-            enabling the stage-2 semantic rerank.
-        llm: optional :class:`patentkit.llm.LLM` enabling LLM keyword
-            generation and stage-3 relevance scoring.
+        vector_store: optional :class:`~patentkit.search.base.VectorStore`;
+            registers the agent's ``semantic_search`` tool when present.
+        llm: optional :class:`patentkit.llm.LLM` driving the agent; ``None``
+            runs the keys-free degraded single-pass keyword search.
         file_wrapper: optional client with an ``enrich_patent(patent)``
-            method (e.g. ``patentkit.connectors.inference.file_wrapper.
-            FileWrapperClient``) used to recover examiner-cited art missing
-            from the patent record; failures are logged and skipped.
+            method used to recover examiner-cited art missing from the
+            patent record; failures are logged and skipped.
     """
 
     def __init__(
@@ -94,7 +125,7 @@ class InvaliditySearchAgent:
         exclude_family: bool,
         custom_exclusions: Sequence[str],
     ) -> dict[str, list[str]]:
-        """Default exclusion sets, keyed by reason (mirrors should_exclude())."""
+        """Default exclusion sets, keyed by reason; enforced at the tool layer."""
         excluded: dict[str, list[str]] = {"self": [str(patent.patent_number)]}
         if exclude_examiner_art:
             examiner = set(patent.examiner_cited_numbers)
@@ -118,62 +149,101 @@ class InvaliditySearchAgent:
             logger.warning("file-wrapper enrichment failed for %s: %s", patent.patent_number, exc)
         return set()
 
-    # ------------------------------------------------------------- keywords
-    def _keywords(self, patent: Patent, claims: list[int], claims_text: str) -> list[str]:
-        """Search keywords from the LLM (LOW-effort task) or local fallback."""
-        if self.llm is not None:
-            prompt = (
-                "Extract 8-15 short technical search keywords/phrases that "
-                "would retrieve prior art for these patent claims. Respond "
-                "with ONLY a JSON array of strings.\n\n"
-                f"Title: {patent.title or ''}\nClaims:\n{claims_text[:5000]}"
-            )
-            try:
-                raw = self.llm.complete_json(prompt, max_tokens=1024)
-                keywords = [str(k) for k in raw if isinstance(k, (str, int))] if isinstance(raw, list) else []
-                if keywords:
-                    return keywords[:15]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("LLM keyword generation failed (%s); using fallback", exc)
-        return _fallback_keywords(patent, claims=claims)
-
     # --------------------------------------------------------------- search
     def search(
         self,
         patent: Patent,
         claims: Optional[list[int]] = None,
         *,
-        extra_query: Optional[SearchQuery] = None,
+        final_k: int = 25,
+        budget_seconds: float = DEFAULT_BUDGET_SECONDS,
+        max_steps: int = DEFAULT_MAX_STEPS,
+        on_step: Optional[Callable[[TraceStep], None]] = None,
         exclude_examiner_art: bool = True,
         exclude_family: bool = True,
         custom_exclusions: Sequence[str] = (),
-        stage2_k: int = 100,
-        final_k: int = 25,
+        feedback_messages: Sequence[str] = (),
+        resume_messages: Optional[list[dict]] = None,
         progress: Optional[Callable[[str], None]] = None,
     ) -> InvaliditySearchResult:
-        """Run the full pipeline for ``patent`` and return ranked prior art.
+        """Run the agentic prior-art search for ``patent``.
 
         Args:
             patent: the target patent.
-            claims: claim numbers to invalidate (default: independent claims,
-                or claim 1).
-            extra_query: user query merged into the stage-1 query (keywords
-                unioned; the prior-art cutoff can only be tightened).
-            exclude_examiner_art: drop examiner-cited references (default on;
-                pass ``False`` to search over them too).
+            claims: claim numbers to invalidate (default: independent
+                claims, or claim 1).
+            final_k: ranked references returned (best first).
+            budget_seconds: wall-clock budget for the agent (default ≤3 min).
+            max_steps: maximum agent rounds.
+            on_step: live callback receiving every
+                :class:`~patentkit.llm.tools.TraceStep`.
+            exclude_examiner_art: drop examiner-cited references (default on).
             exclude_family: drop same-family publications.
             custom_exclusions: extra patent numbers to drop.
-            stage2_k: candidates kept into the rerank/scoring stages.
-            final_k: results returned.
-            progress: optional callback receiving human-readable stage updates.
+            feedback_messages: user feedback injected as user messages
+                (typically together with ``resume_messages``).
+            resume_messages: a previous result's conversation (from
+                ``trace``/guided session) to resume the SAME agent run.
+            progress: optional callback receiving human-readable updates.
         """
         t0 = time.monotonic()
-        timing: dict[str, float] = {}
         claims = claims or [c.number for c in patent.independent_claims] or [1]
-        selected = [c for c in patent.claims if c.number in set(claims)]
-        claims_text = "\n".join(c.text for c in selected) or patent.text_for_search()[:4000]
+        cutoff = patent.best_effective_date()
+        excluded = self._build_exclusions(patent, exclude_examiner_art, exclude_family,
+                                          custom_exclusions)
 
-        excluded = self._build_exclusions(patent, exclude_examiner_art, exclude_family, custom_exclusions)
+        if self.llm is None:
+            return self._degraded_search(patent, claims, excluded, final_k,
+                                         progress=progress, t0=t0)
+
+        def _step(step: TraceStep) -> None:
+            report_progress(progress, step_summary(step))
+            if on_step is not None:
+                on_step(step)
+
+        runner = AgenticSearchRunner(self.keyword_store, self.vector_store, self.llm,
+                                     max_steps=max_steps, budget_seconds=budget_seconds)
+        report_progress(progress, f"agentic invalidity search: cutoff {cutoff}, "
+                                  f"budget {budget_seconds:g}s / {max_steps} steps")
+        outcome: AgenticSearchOutcome = runner.run(
+            "invalidity",
+            target_patent=patent,
+            claims=claims,
+            exclusions=excluded,
+            cutoff_date=cutoff,
+            final_k=final_k,
+            feedback_messages=feedback_messages,
+            resume_messages=resume_messages,
+            on_step=_step,
+        )
+        return InvaliditySearchResult(
+            target=str(patent.patent_number),
+            claims=claims,
+            plan_or_params={
+                "mode": "agentic",
+                "before_date": cutoff.isoformat() if cutoff else None,
+                "final_k": final_k,
+                "max_steps": max_steps,
+                "budget_seconds": budget_seconds,
+                "queries_issued": len(outcome.trace.queries),
+                "rationale": outcome.rationale,
+                "suggested_next_queries": outcome.suggested_next_queries,
+            },
+            results=candidates_to_result_dicts(outcome.results),
+            excluded=excluded,
+            timing={"total": round(time.monotonic() - t0, 4), "agent": outcome.elapsed_s},
+            trace=outcome.trace,
+            stop_reason=outcome.stop_reason,
+            conversation=outcome.messages,
+        )
+
+    # ------------------------------------------------------- degraded mode
+    def _degraded_search(self, patent: Patent, claims: list[int],
+                         excluded: dict[str, list[str]], final_k: int, *,
+                         progress: Optional[Callable[[str], None]],
+                         t0: float) -> InvaliditySearchResult:
+        """Keys-free fallback: ONE plain BM25 pass with the default exclusions."""
+        cutoff = patent.best_effective_date()
         exclude_numbers: list[PatentNumber] = []
         for numbers in excluded.values():
             for raw in numbers:
@@ -181,61 +251,32 @@ class InvaliditySearchAgent:
                     exclude_numbers.append(PatentNumber.parse(raw))
                 except ValueError:
                     logger.warning("Skipping unparseable exclusion number: %r", raw)
-
-        # -- stage 1: broad keyword search with date cutoff + exclusions
-        keywords = self._keywords(patent, claims, claims_text)
-        base_query = SearchQuery(
-            keywords=keywords,
-            before_date=patent.best_effective_date(),
-            exclude_numbers=exclude_numbers,
-            limit=STAGE1_K,
-        )
-        query = merge_query(base_query, extra_query)
-        report_progress(progress, f"stage 1: keyword search ({len(query.keywords)} keywords, "
-                                  f"cutoff {query.before_date})")
-        stage1 = self.keyword_store.search(query)
-        timing["stage1"] = round(time.monotonic() - t0, 4)
-        report_progress(progress, f"stage 1: {len(stage1)} candidates")
-
-        # -- stage 2: semantic rerank via RRF fusion when a vector store exists
-        t1 = time.monotonic()
-        if self.vector_store is not None and stage1:
-            vector_results = self.vector_store.search_text(claims_text, limit=stage2_k, query=query)
-            candidates = fuse_rankings([stage1, vector_results])[:stage2_k]
-            report_progress(progress, f"stage 2: fused keyword+vector rankings ({len(candidates)} kept)")
-        else:
-            candidates = stage1[:stage2_k]
-        timing["stage2"] = round(time.monotonic() - t1, 4)
-
-        # -- stage 3: batched LLM relevance scoring (skipped without an LLM)
-        t2 = time.monotonic()
-        llm_scores = llm_relevance_scores(self.llm, candidates, claims_text)
-        ranked = combine_scores(candidates, llm_scores)
-        timing["stage3"] = round(time.monotonic() - t2, 4)
-        if llm_scores:
-            report_progress(progress, f"stage 3: LLM scored {len(llm_scores)} candidates")
-        else:
-            report_progress(progress, "stage 3: skipped (no LLM) — keeping stage-2 ranking")
-
-        timing["total"] = round(time.monotonic() - t0, 4)
+        keywords = _fallback_keywords(patent, claims=claims)
+        query = SearchQuery(keywords=keywords, before_date=cutoff,
+                            exclude_numbers=exclude_numbers, limit=max(final_k, 25))
+        report_progress(progress, "degraded keys-free mode: single keyword pass "
+                                  f"({len(keywords)} keywords, cutoff {cutoff})")
+        hits = self.keyword_store.search(query)
+        max_score = max((r.score for r in hits), default=0.0) or 1.0
+        results = [result_to_dict(r, r.score / max_score,
+                                  "degraded mode: BM25 keyword relevance only")
+                   for r in hits[:final_k]]
         return InvaliditySearchResult(
             target=str(patent.patent_number),
             claims=claims,
             plan_or_params={
-                "keywords": query.keywords,
-                "required_keywords": query.required_keywords,
-                "excluded_keywords": query.excluded_keywords,
-                "before_date": query.before_date.isoformat() if query.before_date else None,
-                "stage1_k": query.limit,
-                "stage2_k": stage2_k,
+                "mode": "degraded_keyword_only",
+                "before_date": cutoff.isoformat() if cutoff else None,
+                "keywords": keywords,
                 "final_k": final_k,
-                "llm_rerank": bool(llm_scores),
-                "vector_rerank": self.vector_store is not None,
             },
-            results=[result_to_dict(r, score, why) for r, score, why in ranked[:final_k]],
+            results=results,
             excluded=excluded,
-            timing=timing,
+            timing={"total": round(time.monotonic() - t0, 4)},
+            trace=None,
+            stop_reason="degraded",
         )
 
 
-__all__ = ["InvaliditySearchAgent", "InvaliditySearchResult", "STAGE1_K"]
+__all__ = ["InvaliditySearchAgent", "InvaliditySearchResult",
+           "candidates_to_result_dicts", "step_summary"]

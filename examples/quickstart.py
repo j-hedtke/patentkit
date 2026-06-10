@@ -1,8 +1,11 @@
 """patentkit quickstart — a fully offline invalidity search demo.
 
 Builds five tiny synthetic patents, indexes them in the in-memory BM25
-store, and runs the 3-stage invalidity agent in keys-free degraded mode
-(no LLM, no vector store, no network). Run it with:
+store, and runs the invalidity search agent in keys-free degraded mode
+(no LLM, no vector store, no network): a single keyword pass with the
+default exclusions. With an LLM configured the same agent runs a pure
+agentic search — the model generates and refines its own queries via tool
+use and returns a full reasoning trace. Run it with:
 
     python examples/quickstart.py
 """
@@ -96,7 +99,8 @@ store = BM25Store()
 store.index(corpus)
 print(f"Indexed {len(store)} patents.\n")
 
-# Plug in providers here for the full pipeline:
+# Plug in providers here for the full agentic search (the LLM generates and
+# refines its own queries via tool use; result.trace holds the reasoning):
 #   llm=get_llm("high")                          # needs ANTHROPIC_API_KEY / OPENAI_API_KEY
 #   vector_store=InMemoryVectorStore(VoyageEmbeddings())   # needs VOYAGE_API_KEY
 #   file_wrapper=FileWrapperClient(...)          # recovers examiner citations

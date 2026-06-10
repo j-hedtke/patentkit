@@ -70,6 +70,20 @@ class LLM:
                   max_tokens: int, temperature: float, stop: Optional[list[str]]) -> LLMResponse:
         raise NotImplementedError
 
+    def run_tools(self, messages: list[dict], *, system: str | None = None,
+                  tools: Any = (), max_tokens: int = 4096):
+        """Run ONE tool-use round: send the neutral-schema conversation with
+        the given :class:`~patentkit.llm.tools.ToolDef` list attached and
+        return a :class:`~patentkit.llm.tools.ToolRound` (assistant text +
+        requested tool calls). The agent loop lives in
+        :func:`patentkit.llm.tools.run_tool_loop`, which calls this once per
+        round and enforces step/wall-clock budgets."""
+        raise NotImplementedError(
+            f"The {type(self).__name__} provider does not support tool use. "
+            "Use the Anthropic or OpenAI provider (or a test fake implementing "
+            "run_tools) to run agentic search."
+        )
+
 
 @dataclass
 class UsageTracker:
@@ -98,6 +112,15 @@ class _TrackedLLM(LLM):
                                          temperature=temperature, stop=stop)
         self._tracker.record(response)
         return response
+
+    def run_tools(self, messages, *, system=None, tools=(), max_tokens=4096):
+        round_ = self._inner.run_tools(messages, system=system, tools=tools,
+                                       max_tokens=max_tokens)
+        self._tracker.record(LLMResponse(
+            text=round_.text, model=self.model,
+            input_tokens=round_.input_tokens, output_tokens=round_.output_tokens,
+        ))
+        return round_
 
 
 def get_llm(
