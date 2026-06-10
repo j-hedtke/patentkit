@@ -180,3 +180,13 @@ class TestVectorStore:
         results = store.search_text("inductive coil charging")
         assert results[0].patent_number.number == "1"
         assert results[0].passages
+
+
+def test_parse_json_tolerates_control_chars_in_strings():
+    """Models echoing verbatim claim/spec text emit raw newlines inside JSON
+    strings; parse_json must accept them (json strict=False)."""
+    from patentkit.llm.base import LLMResponse
+
+    raw = '{"limitations": ["an input device\nfor receiving data;", "tab\there"]}'
+    data = LLMResponse(text=raw, model="test").parse_json()
+    assert data["limitations"][0] == "an input device\nfor receiving data;"

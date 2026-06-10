@@ -1,4 +1,6 @@
-"""Tests for markdown chart/report rendering (dependency-free paths only)."""
+"""Tests for chart/report rendering (DOCX test skips without python-docx)."""
+
+import pytest
 
 from patentkit.analysis.fto import FtoFinding, FtoReportData
 from patentkit.analysis.infringement import EvidenceItem, InfringementFinding
@@ -76,6 +78,42 @@ class TestClaimChartMarkdown:
         assert "a frame supporting the housing" in html
         assert "background-color:#c6efce" in html  # disclosed = green
         assert "col. 2, ll. 10-12" in html
+
+
+class TestClaimChartDocx:
+    def test_citation_on_own_paragraph_once(self, tmp_path):
+        pytest.importorskip("docx")
+        from docx import Document
+
+        from patentkit.formatting import claim_chart_docx
+
+        out = tmp_path / "chart.docx"
+        claim_chart_docx(make_chart(), str(out))
+
+        document = Document(str(out))
+        table = document.tables[0]
+        # row 1 (first limitation), column 1 (US111): the cell with a citation
+        cell = table.rows[1].cells[1]
+        citation = "col. 2, ll. 10-12"
+        cell_text = "\n".join(p.text for p in cell.paragraphs)
+        assert cell_text.count(citation) == 1
+        # the citation sits on its OWN paragraph, not appended to the quote
+        cite_pars = [p for p in cell.paragraphs if citation in p.text]
+        assert len(cite_pars) == 1
+        cite_par = cite_pars[0]
+        assert cite_par.text == f"[{citation}]"
+        quote_par = next(p for p in cell.paragraphs if "a frame 12 supports" in p.text)
+        assert citation not in quote_par.text
+        # typography: citation 8pt non-italic; quote 9pt italic with spacing
+        from docx.shared import Pt
+
+        assert cite_par.runs[0].font.size == Pt(8)
+        assert not cite_par.runs[0].italic
+        assert cite_par.paragraph_format.space_after == Pt(6)
+        assert quote_par.runs[0].italic
+        assert quote_par.runs[0].font.size == Pt(9)
+        assert quote_par.paragraph_format.space_before == Pt(4)
+        assert quote_par.paragraph_format.space_after == Pt(4)
 
 
 class TestInvalidityReport:

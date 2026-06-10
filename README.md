@@ -16,12 +16,14 @@ Extras: `anthropic`, `openai`, `elasticsearch`, `docx`, `pdf`, `viz`, `mcp`, `sc
 
 ## Demo: agentic invalidity search → claim chart
 
-One toy IPR queryset ([IPR2020-00104](https://portal.unifiedpatents.com/ptab/case/IPR2020-00104),
-Apple's '647 "data detectors" patent) end to end: the agent writes and refines
-its own queries over a 300-patent corpus of real scraped patents, finds both
-ground-truth references from the IPR petition, then charts claim 1 against the
-top hit — quoting the reference verbatim and locating every quote in the issued
-PDF as a column/line citation:
+One toy IPR-style queryset end to end, built around Apple's US5946647A (the
+'647 "data detectors" patent) with two real prior-art patents as ground truth:
+the agent writes and refines its own queries over a 300-patent corpus of real
+scraped patents, finds both ground-truth references, then charts claim 1
+against the top hit — quoting the reference verbatim and locating every quote
+in the issued PDF as a column/line citation. (The toy dataset's
+"IPR2020-001xx" proceeding labels are illustrative placeholders, not real PTAB
+citations — the actual IPR2020-00104 concerns an unrelated patent.)
 
 ![agentic invalidity search demo](docs/assets/demo.gif)
 
@@ -153,6 +155,14 @@ tools = openai_tool_definitions()   # pass to responses.create(tools=...)
 # dispatch tool calls back through handle_tool_call(toolset, name, args_json)
 ```
 
+Note on OpenAI surfaces: the 2023 "ChatGPT plugins" system is retired. The
+current equivalents are (a) function tools in the API — exactly what
+`openai_tool_definitions()` ships — and (b) MCP: the Responses API has a
+built-in `mcp` tool type for remote MCP servers, and ChatGPT supports custom
+connectors/apps backed by remote MCP. patentkit's MCP server (`patentkit-mcp`)
+works there too, not just with Claude — it runs locally over stdio, so for
+OpenAI's remote-MCP integrations expose it at an HTTP endpoint they can reach.
+
 **Word add-in** — `integrations/word-plugin/` is an Office.js taskpane for
 patent drafting (draft claims, check antecedent basis, draft spec sections)
 backed by a local patentkit HTTP server.
@@ -174,11 +184,26 @@ truth) or from user feedback via `UserEvalSetBuilder`.
 `scripts/eval_e2e.sh`: it provisions a local Dockerized Elasticsearch, builds
 (or reuses) the live-scraped 300-patent corpus, indexes it, and runs the
 invalidity eval twice — keys-free baseline, then the full agentic loop if
-`ANTHROPIC_API_KEY`/`OPENAI_API_KEY` is set. If you use Claude Code, the
-`eval-e2e` skill (`.claude/skills/eval-e2e/`) drives the same playbook
-end-to-end, including the managed-cluster variant and the write-up
-(`docs/evals/` has results). Baseline numbers are the degraded keyword-only
-fallback — never read them as agentic performance.
+`ANTHROPIC_API_KEY`/`OPENAI_API_KEY` is set. Baseline numbers are the degraded
+keyword-only fallback — never read them as agentic performance.
+
+### Reproduce with Claude Code
+
+From a fresh clone, with Docker running and an `ANTHROPIC_API_KEY` in `.env`,
+open Claude Code in the repo and say `/eval-e2e` (or "set up the eval cluster
+and run the experiments"). The `eval-e2e` skill (`.claude/skills/eval-e2e/`)
+drives the whole playbook:
+
+1. Provisions a local Dockerized Elasticsearch 8.14.3 (single node).
+2. Builds or reuses the 300-patent corpus — a live Google Patents scrape,
+   ~15 min on the first run, resumable.
+3. Indexes it into ES and sanity-checks the count.
+4. Runs the keys-free baseline, then the live agentic eval (roughly 4-5 min
+   per query — it's a real tool-use loop with saved reasoning traces).
+5. Writes the baseline-vs-agentic comparison into `docs/evals/`.
+
+The baseline is the degraded keyword-only floor and must never be read as
+agentic performance — the write-up labels both modes explicitly.
 
 ## Legal note
 

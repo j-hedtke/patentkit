@@ -15,6 +15,12 @@ distractor is topically adjacent:
 | US5946647A (Apple '647, data detectors) | action on detected text structures | US5644735A, US5859636A |
 | US8046721B2 (slide-to-unlock) | gesture unlock on touch display | US6209104B1, US5821933A |
 
+Note: these querysets come from the toy IPR dataset
+(`patentkit.evals.data/ipr_toy.jsonl`), whose `proceeding` labels
+("IPR2020-00104", "IPR2020-00103", …) are illustrative placeholders, **not
+real PTAB proceeding citations** (the actual IPR2020-00104 concerns an
+unrelated patent). The patents and prior-art references themselves are real.
+
 Pipeline: `scripts/build_eval_corpus.py` (scrape) → `scripts/index_eval_corpus.py`
 (ES index) → `scripts/run_invalidity_eval.py` (InvaliditySearchAgent → recall@k/MRR).
 

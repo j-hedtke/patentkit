@@ -22,35 +22,106 @@ def make_patent(claims: list[Claim]) -> Patent:
 
 CLAIM_TEXT = "A widget comprising: a frame; and a motor coupled to the frame."
 
+# Realistic multi-element claim, modeled on US5946647A claim 1.
+DETECT_CLAIM_TEXT = (
+    "A computer-based system for detecting structures in data and performing "
+    "actions on detected structures, comprising: an input device for receiving "
+    "data; an output device for presenting the data; a memory storing "
+    "information including program routines including an analyzer server for "
+    "detecting structures in the data, and for linking actions to the detected "
+    "structures; and a processing unit coupled to the input device, the output "
+    "device, and the memory for controlling the execution of the program "
+    "routines."
+)
+
+DETECT_PREAMBLE = (
+    "A computer-based system for detecting structures in data and performing "
+    "actions on detected structures, comprising:"
+)
+DETECT_ELEMENT_1 = "an input device for receiving data;"
+
+
+def normalize(text: str) -> str:
+    return " ".join(text.split())
+
+
+def assert_verbatim_in_order(limitations, claim_text):
+    """Every limitation is a verbatim substring (after whitespace
+    normalization) with a span, and spans strictly increase."""
+    norm_claim = normalize(claim_text)
+    assert limitations, "expected at least one limitation"
+    for lim in limitations:
+        assert normalize(lim.text) in norm_claim
+        assert lim.span is not None
+        start, end = lim.span
+        assert claim_text[start:end] == lim.text
+    starts = [lim.span[0] for lim in limitations]
+    assert starts == sorted(starts)
+    assert len(set(starts)) == len(starts)  # strictly increasing
+
 
 class TestSplitAtomicLimitations:
-    def test_split_with_valid_and_invalid_spans(self):
-        claim = Claim(number=1, text=CLAIM_TEXT)
-        lim_a = "A widget comprising a frame"
-        lim_b = "a motor coupled to the frame"
+    def test_verbatim_segments_sorted_into_claim_order(self):
+        claim = Claim(number=1, text=DETECT_CLAIM_TEXT)
+        # LLM returns verbatim segments but OUT of order and with sloppy
+        # internal whitespace; code must locate, re-slice, and sort them.
         llm = FakeLLM(
             responses=[
-                [lim_a, lim_b],
                 [
-                    {"limitation": lim_a, "start": 0, "end": 27},
-                    {"limitation": lim_b, "start": 50, "end": 10},  # invalid: start > end
-                ],
+                    "an  output device for presenting the data;",
+                    DETECT_PREAMBLE,
+                    DETECT_ELEMENT_1,
+                ]
             ]
         )
         limitations = split_atomic_limitations(claim, llm=llm)
-        assert [lim.text for lim in limitations] == [lim_a, lim_b]
-        # valid span kept from the LLM
-        assert limitations[0].span == (0, 27)
-        # invalid span fell back to case-insensitive substring search
-        start = CLAIM_TEXT.lower().find(lim_b.lower())
-        assert limitations[1].span == (start, start + len(lim_b))
-        assert len(llm.prompts) == 2
+        assert_verbatim_in_order(limitations, DETECT_CLAIM_TEXT)
+        # (c) preamble first, then the first element after the preamble
+        assert limitations[0].text == DETECT_PREAMBLE
+        assert limitations[1].text == DETECT_ELEMENT_1
+        # whitespace-sloppy segment was re-sliced verbatim from the claim
+        assert limitations[2].text == "an output device for presenting the data;"
+        assert len(llm.prompts) == 1  # single split call, no span-mapping call
 
-    def test_unfindable_limitation_gets_none_span(self):
-        claim = Claim(number=1, text=CLAIM_TEXT)
-        llm = FakeLLM(responses=[["a paraphrased requirement not in the claim"], []])
+    def test_llm_none_uses_deterministic_structural_split(self):
+        claim = Claim(number=1, text=DETECT_CLAIM_TEXT)
+        limitations = split_atomic_limitations(claim, llm=None)
+        assert_verbatim_in_order(limitations, DETECT_CLAIM_TEXT)
+        texts = [lim.text for lim in limitations]
+        assert texts[0] == DETECT_PREAMBLE
+        assert texts[1] == DETECT_ELEMENT_1
+        assert texts[2] == "an output device for presenting the data;"
+        # "; and" delimiter stays with the preceding element
+        assert texts[3].endswith("to the detected structures; and")
+        assert texts[4].startswith("a processing unit coupled to")
+        # together the segments cover essentially the whole claim
+        assert normalize(" ".join(texts)) == normalize(DETECT_CLAIM_TEXT)
+
+    def test_paraphrasing_llm_falls_back_to_verbatim_segments(self):
+        claim = Claim(number=1, text=DETECT_CLAIM_TEXT)
+        llm = FakeLLM(
+            responses=[
+                [
+                    "The system comprises an input device for receiving data.",
+                    "There is an output device.",
+                ]
+            ]
+        )
         limitations = split_atomic_limitations(claim, llm=llm)
-        assert limitations[0].span is None
+        # paraphrases never survive: result is verbatim, in order
+        assert_verbatim_in_order(limitations, DETECT_CLAIM_TEXT)
+        assert limitations[0].text == DETECT_PREAMBLE
+        assert limitations[1].text == DETECT_ELEMENT_1
+        for lim in limitations:
+            assert "The system comprises" not in lim.text
+
+    def test_case_insensitive_fallback_match(self):
+        claim = Claim(number=1, text=CLAIM_TEXT)
+        llm = FakeLLM(responses=[["A widget comprising:", "A MOTOR coupled to the frame."]])
+        limitations = split_atomic_limitations(claim, llm=llm)
+        assert_verbatim_in_order(limitations, CLAIM_TEXT)
+        # re-sliced with the claim's original casing
+        assert limitations[1].text == "a motor coupled to the frame."
 
 
 class TestBuildClaimChart:
@@ -58,8 +129,7 @@ class TestBuildClaimChart:
         patent = make_patent([Claim(number=1, text="A device comprising: lim A; and lim B.")])
         llm = FakeLLM(
             responses=[
-                ["lim A", "lim B"],  # split
-                [],                  # span mapping (falls back to substring search)
+                ["lim A", "lim B"],  # split (verbatim segments of the claim)
                 # reference US111: lim A disclosed, lim B not
                 {"status": "disclosed", "reasoning": "teaches A", "quotes": ["the art shows A"]},
                 {"status": "not disclosed", "reasoning": "silent on B", "quotes": []},
@@ -85,16 +155,16 @@ class TestBuildClaimChart:
         assert chart.coverage_summary() == {"US111": 0.5, "US222": 0.5}
         # but together they cover both
         assert chart.combined_coverage() == 1.0
-        # 2 split calls + 4 assess calls
-        assert len(llm.prompts) == 6
+        # 1 split call + 4 assess calls
+        assert len(llm.prompts) == 5
 
     def test_locator_attaches_citations(self):
         patent = make_patent([Claim(number=1, text="A device comprising: lim A.")])
         llm = FakeLLM(
             responses=[
-                ["lim A"],
-                [],
+                ["A device comprising:", "lim A."],
                 {"status": "disclosed", "reasoning": "r", "quotes": ["quoted passage"]},
+                {"status": "disclosed", "reasoning": "r", "quotes": []},
             ]
         )
         chart = build_claim_chart(

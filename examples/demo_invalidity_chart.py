@@ -1,6 +1,7 @@
 """patentkit demo — agentic invalidity search to a finished claim-chart DOCX.
 
-One toy IPR queryset (IPR2020-00104: Apple's '647 "data detectors" patent),
+One toy IPR-style queryset (Apple's '647 "data detectors" patent; the
+dataset's proceeding labels are illustrative, not real PTAB citations),
 end to end:
 
   1. corpus    — real patents: reuses data/eval_corpus/corpus.jsonl when
@@ -43,7 +44,7 @@ from patentkit.search.bm25 import BM25Store
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-QUERY_PATENT = "US5946647A"  # toy IPR queryset, proceeding IPR2020-00104
+QUERY_PATENT = "US5946647A"  # toy IPR-style queryset (illustrative, not a real proceeding)
 CLAIM_NUMBER = 1
 GROUND_TRUTH = ["US5644735A", "US5859636A"]
 
@@ -147,11 +148,11 @@ def download_reference_pdf(number: str) -> Path | None:
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    banner("1/5", f"corpus — toy IPR queryset {QUERY_PATENT} (IPR2020-00104)")
+    banner("1/5", f"corpus — toy IPR-style queryset {QUERY_PATENT}")
     patents = load_corpus()
     target = patents[QUERY_PATENT]
     print(f"target: {QUERY_PATENT} — {target.title}")
-    print(f"ground-truth prior art (from the IPR petition): {', '.join(GROUND_TRUTH)}")
+    print(f"ground-truth prior art (real references, toy queryset): {', '.join(GROUND_TRUTH)}")
 
     banner("2/5", "agentic invalidity search (model-driven tool-use loop, BM25 store)")
     store = BM25Store()

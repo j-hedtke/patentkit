@@ -177,15 +177,25 @@ def claim_chart_docx(chart: ClaimChart, out_path: str, color_coding: bool = True
                 continue
             status_par = cell.paragraphs[0]
             status_par.add_run(_STATUS_LABEL[finding.status]).bold = True
+            status_par.paragraph_format.space_after = Pt(4)
             if finding.reasoning:
-                cell.add_paragraph(finding.reasoning)
+                reasoning_par = cell.add_paragraph(finding.reasoning)
+                reasoning_par.paragraph_format.space_after = Pt(6)
             for qi, quote in enumerate(finding.quotes):
                 par = cell.add_paragraph()
+                par.paragraph_format.space_before = Pt(4)
+                par.paragraph_format.space_after = Pt(4)
                 run = par.add_run(f"“{quote}”")
                 run.italic = True
                 run.font.size = Pt(9)
                 if finding.citation and qi == 0:
-                    par.add_run(f" [{finding.citation}]").font.size = Pt(9)
+                    # the citation was located from the first quote only
+                    # (see assess_reference); give it its own paragraph
+                    cite_par = cell.add_paragraph()
+                    cite_par.paragraph_format.space_after = Pt(6)
+                    cite_run = cite_par.add_run(f"[{finding.citation}]")
+                    cite_run.italic = False
+                    cite_run.font.size = Pt(8)
             if color_coding:
                 shade(cell, _STATUS_FILL[finding.status])
 

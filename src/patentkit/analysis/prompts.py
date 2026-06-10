@@ -54,12 +54,17 @@ assessable requirements of the claim.
 </claim>
 
 Rules:
-1. Together the limitations must cover ALL of the claim language, including the
-   preamble; do not drop any clause.
-2. Each limitation should read as a complete, self-contained requirement.
-3. If an element recites alternatives ("at least one of: a, b, c"), emit one
-   limitation per alternative ("wherein x includes a", "wherein x includes b", ...).
-4. Keep limitations as non-overlapping as possible.
+1. Each limitation must be a VERBATIM, contiguous segment of the claim text.
+   Copy it exactly as written — do NOT paraphrase, reword, abbreviate, expand,
+   or normalize punctuation or capitalization.
+2. List the limitations in the order they appear in the claim (document order):
+   the preamble segment first (everything up to and including "comprising:" or
+   the equivalent transitional phrase), then each claim element verbatim, in
+   order.
+3. Do not reorder segments, and do not merge text across semicolons unless a
+   single element genuinely spans them.
+4. Together the segments must cover essentially ALL of the claim language,
+   including the preamble; do not drop any clause.
 
 Return ONLY a JSON list of strings, e.g. ["limitation 1", "limitation 2"]."""
 

@@ -29,14 +29,19 @@ class LLMResponse:
     raw: Any = None
 
     def parse_json(self) -> Any:
-        """Parse a JSON object/array from the response, tolerating code fences."""
+        """Parse a JSON object/array from the response, tolerating code fences.
+
+        ``strict=False``: models echoing verbatim source text (claim segments,
+        spec quotes) emit raw newlines/tabs inside JSON strings, which strict
+        parsing rejects.
+        """
         text = self.text.strip()
         fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
         if fence:
             text = fence.group(1).strip()
         start = min((i for i in (text.find("{"), text.find("[")) if i != -1), default=0)
         end = max(text.rfind("}"), text.rfind("]")) + 1 or len(text)
-        return json.loads(text[start:end])
+        return json.loads(text[start:end], strict=False)
 
 
 class LLM:
