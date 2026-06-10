@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>patentkit Drafting</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script src="taskpane.js" defer></script>
+  <style>
+    body { font-family: "Segoe UI", -apple-system, sans-serif; margin: 12px; font-size: 13px; }
+    h1 { font-size: 16px; }
+    h2 { font-size: 13px; margin: 16px 0 4px; }
+    label { display: block; margin: 8px 0 2px; font-weight: 600; }
+    textarea, input, select { width: 100%; box-sizing: border-box; font: inherit; }
+    textarea { min-height: 90px; }
+    button { margin-top: 8px; padding: 6px 14px; font: inherit; cursor: pointer; }
+    #status { margin-top: 12px; color: #444; white-space: pre-wrap; }
+    .error { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>patentkit Drafting</h1>
+  <p>Local helper server must be running: <code>python serve.py</code> (port 8756).</p>
+
+  <h2>Draft Claims</h2>
+  <label for="disclosure">Invention disclosure</label>
+  <textarea id="disclosure" placeholder="Describe the invention..."></textarea>
+  <label for="n-independent">Independent claims</label>
+  <input id="n-independent" type="number" value="1" min="1" />
+  <label for="n-dependent">Dependent claims</label>
+  <input id="n-dependent" type="number" value="5" min="0" />
+  <button id="btn-draft-claims">Draft Claims</button>
+
+  <h2>Check Antecedent Basis</h2>
+  <p>Select the claims in the document, then:</p>
+  <button id="btn-check-basis">Check Antecedent Basis</button>
+
+  <h2>Insert Spec Section</h2>
+  <label for="section">Section</label>
+  <select id="section">
+    <option>Field of the Invention</option>
+    <option>Background</option>
+    <option selected>Summary</option>
+    <option>Brief Description of the Drawings</option>
+    <option>Detailed Description</option>
+    <option>Abstract</option>
+  </select>
+  <button id="btn-draft-section">Insert Spec Section</button>
+
+  <div id="status"></div>
+</body>
+</html>

@@ -1,0 +1,5 @@
+{
+  "name": "patentkit",
+  "description": "Patent search and analysis toolkit: guided invalidity / FTO / infringement searches, claim charting, and drafting support backed by the patentkit MCP server.",
+  "version": "0.1.0"
+}
