@@ -145,6 +145,16 @@ Ships with a clearly-labeled toy IPR dataset; build real ones with
 `patentkit.connectors.training.ipr_datasets` (PTAB final decisions → ground
 truth) or from user feedback via `UserEvalSetBuilder`.
 
+**Reproduce the IPR-example experiments from a fresh clone** with
+`scripts/eval_e2e.sh`: it provisions a local Dockerized Elasticsearch, builds
+(or reuses) the live-scraped 300-patent corpus, indexes it, and runs the
+invalidity eval twice — keys-free baseline, then the full agentic loop if
+`ANTHROPIC_API_KEY`/`OPENAI_API_KEY` is set. If you use Claude Code, the
+`eval-e2e` skill (`.claude/skills/eval-e2e/`) drives the same playbook
+end-to-end, including the managed-cluster variant and the write-up
+(`docs/evals/` has results). Baseline numbers are the degraded keyword-only
+fallback — never read them as agentic performance.
+
 ## Legal note
 
 patentkit produces research aids, not legal advice. Invalidity, FTO, and

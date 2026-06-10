@@ -6,6 +6,8 @@ venv/
 dist/
 build/
 .env
+.envrc
+.claude/scheduled_tasks.lock
 .pytest_cache/
 .ruff_cache/
 *.docx
