@@ -30,7 +30,7 @@ all = [
 patentkit-mcp = "patentkit.integrations.mcp_server:main"
 
 [project.urls]
-Homepage = "https://github.com/patentkit/patentkit"
+Homepage = "https://github.com/j-hedtke/patentkit"
 
 [build-system]
 requires = ["hatchling"]
