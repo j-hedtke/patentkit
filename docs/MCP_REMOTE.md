@@ -62,3 +62,25 @@ query-param form.
   (`PATENTKIT_PROVIDER` credentials). Treat the token like an API key.
 - Keep the bind on `127.0.0.1` and let cloudflared do the exposure; kill the
   tunnel when you're done (the URL dies with it).
+
+## Persistent deployment (GCP)
+
+The cloudflared recipe above is the **quick local demo** — the URL dies with
+your laptop. For a server that's always reachable and keeps its corpus,
+sessions, and graph stores across restarts, deploy to Google Cloud Run with a
+GCS bucket mounted at `/data` and secrets (your Anthropic key + an
+auto-generated access token) in Secret Manager. One scale-to-zero instance:
+roughly $0 while idle; LLM calls bill to your key.
+
+```bash
+git clone https://github.com/j-hedtke/patentkit && cd patentkit
+PROJECT=<your-gcp-project> ./scripts/deploy_gcp.sh
+# then paste the printed https://...run.app/mcp?token=... URL into
+# claude.ai -> Settings -> Connectors -> Add custom connector
+```
+
+The script is idempotent (re-run it after any failure) and prints the
+connector URL, the token, and a curl verification command at the end. For a
+guided, conversational path — preflight checks, key handling, common GCP
+failure fixes, teardown — use the `deploy-gcp` skill
+(`.claude/skills/deploy-gcp/SKILL.md`) from Claude Code.

@@ -1,0 +1,16 @@
+# Keep the build context lean: the image only needs pyproject.toml,
+# README.md, LICENSE, and src/ (see Dockerfile COPY lines).
+.git
+.venv
+data/
+docs/assets/
+tests/
+examples/
+plugins/
+integrations/
+scripts/eval_corpus/
+scripts/*.log
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.claude/
