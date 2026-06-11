@@ -54,7 +54,17 @@ AR_REPO="patentkit"                                    # Artifact Registry repo
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${AR_REPO}/patentkit-mcp:latest"
 KEY_SECRET="patentkit-anthropic-key"                   # Secret Manager names
 TOKEN_SECRET="patentkit-mcp-token"
+SIGNING_SECRET="patentkit-oauth-signing"               # HS256 key for issued JWTs
+GOOGLE_SECRET="patentkit-google-oauth-secret"          # Google OAuth client secret
 CORPUS_LOCAL="${REPO_ROOT}/data/eval_corpus/corpus.jsonl"
+
+# AUTH_MODE: "token" (static bearer in the URL, default) or "oauth-google"
+# (Google sign-in gated by an email allowlist; tokens ride the Authorization
+# header). oauth-google additionally needs, via env or flags:
+#   GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET  (one-time, made in the
+#     Google Cloud console — gcloud cannot create OAuth web clients), and
+#   ALLOWED_EMAILS  (comma-separated Google accounts allowed to sign in).
+AUTH_MODE="${AUTH_MODE:-token}"
 
 echo "==> Deploying patentkit MCP server"
 echo "    project: ${PROJECT}   region: ${REGION}"
@@ -132,7 +142,32 @@ else
   echo "    (rotate with: gcloud secrets versions add ${KEY_SECRET} --data-file=- )"
 fi
 
-if ! gcloud secrets describe "$TOKEN_SECRET" --project "$PROJECT" >/dev/null 2>&1; then
+if [[ "$AUTH_MODE" == "oauth-google" ]]; then
+  if [[ -z "${GOOGLE_OAUTH_CLIENT_ID:-}" || -z "${GOOGLE_OAUTH_CLIENT_SECRET:-}" || -z "${ALLOWED_EMAILS:-}" ]]; then
+    echo "ERROR: oauth-google mode needs GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET," >&2
+    echo "       and ALLOWED_EMAILS (create the OAuth web client in the Google Cloud console;" >&2
+    echo "       its authorized redirect URI is <service-url>/auth/google/callback)." >&2
+    exit 1
+  fi
+  # Google client secret in Secret Manager (create or rotate to keep deploys current).
+  if gcloud secrets describe "$GOOGLE_SECRET" --project "$PROJECT" >/dev/null 2>&1; then
+    printf '%s' "$GOOGLE_OAUTH_CLIENT_SECRET" | gcloud secrets versions add "$GOOGLE_SECRET" \
+      --project "$PROJECT" --data-file=-
+  else
+    printf '%s' "$GOOGLE_OAUTH_CLIENT_SECRET" | gcloud secrets create "$GOOGLE_SECRET" \
+      --project "$PROJECT" --replication-policy automatic --data-file=-
+  fi
+  echo "    stored Google OAuth client secret (${GOOGLE_SECRET})."
+  # HS256 signing key for the JWTs patentkit issues (generate once, then reuse
+  # so existing sessions survive redeploys).
+  if ! gcloud secrets describe "$SIGNING_SECRET" --project "$PROJECT" >/dev/null 2>&1; then
+    openssl rand -hex 32 | gcloud secrets create "$SIGNING_SECRET" \
+      --project "$PROJECT" --replication-policy automatic --data-file=-
+    echo "    generated token-signing key (${SIGNING_SECRET})."
+  else
+    echo "    signing key ${SIGNING_SECRET} already exists — reusing it."
+  fi
+elif ! gcloud secrets describe "$TOKEN_SECRET" --project "$PROJECT" >/dev/null 2>&1; then
   MCP_TOKEN="$(openssl rand -hex 32)"
   printf '%s' "$MCP_TOKEN" | gcloud secrets create "$TOKEN_SECRET" \
     --project "$PROJECT" --replication-policy automatic --data-file=-
@@ -150,7 +185,12 @@ fi
 echo "==> [6/8] Granting the Cloud Run service account access..."
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format 'value(projectNumber)')"
 RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-for secret in "$KEY_SECRET" "$TOKEN_SECRET"; do
+if [[ "$AUTH_MODE" == "oauth-google" ]]; then
+  GRANT_SECRETS=("$KEY_SECRET" "$GOOGLE_SECRET" "$SIGNING_SECRET")
+else
+  GRANT_SECRETS=("$KEY_SECRET" "$TOKEN_SECRET")
+fi
+for secret in "${GRANT_SECRETS[@]}"; do
   gcloud secrets add-iam-policy-binding "$secret" --project "$PROJECT" \
     --member "serviceAccount:${RUNTIME_SA}" \
     --role roles/secretmanager.secretAccessor >/dev/null
@@ -171,6 +211,28 @@ gcloud builds submit "$REPO_ROOT" --tag "$IMAGE" --project "$PROJECT"
 # required for Cloud Storage volume mounts. The long request timeout covers
 # multi-minute agentic searches.
 echo "==> [8/8] Deploying to Cloud Run..."
+# In oauth-google mode the issuer/PUBLIC_URL must equal the service's own URL,
+# which only exists after the service is first created. Resolve it up front;
+# if the service is brand new, do a token-mode-style first deploy is avoided by
+# requiring the service to already exist (run once in token mode, or just let
+# this resolve to empty and re-run — Cloud Run assigns a stable URL on create).
+PUBLIC_URL="$(gcloud run services describe "$SERVICE" \
+  --region "$REGION" --project "$PROJECT" --format 'value(status.url)' 2>/dev/null || true)"
+
+COMMON_ENV="PATENTKIT_PROVIDER=anthropic,PATENTKIT_INDEX_JSONL=/data/corpus.jsonl,PATENTKIT_SESSION_DIR=/data/sessions"
+if [[ "$AUTH_MODE" == "oauth-google" ]]; then
+  if [[ -z "$PUBLIC_URL" ]]; then
+    echo "ERROR: oauth-google needs the service URL up front, but ${SERVICE} does not exist yet." >&2
+    echo "       Deploy once in token mode (AUTH_MODE=token) to mint the URL, then re-run in oauth-google." >&2
+    exit 1
+  fi
+  ENV_VARS="${COMMON_ENV},PATENTKIT_AUTH_MODE=oauth-google,PATENTKIT_PUBLIC_URL=${PUBLIC_URL},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID},PATENTKIT_ALLOWED_EMAILS=${ALLOWED_EMAILS},PATENTKIT_OAUTH_DIR=/data/oauth"
+  SECRETS="ANTHROPIC_API_KEY=${KEY_SECRET}:latest,GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_SECRET}:latest,PATENTKIT_OAUTH_SIGNING_SECRET=${SIGNING_SECRET}:latest"
+else
+  ENV_VARS="$COMMON_ENV"
+  SECRETS="ANTHROPIC_API_KEY=${KEY_SECRET}:latest,PATENTKIT_MCP_TOKEN=${TOKEN_SECRET}:latest"
+fi
+
 gcloud run deploy "$SERVICE" \
   --image "$IMAGE" \
   --project "$PROJECT" \
@@ -184,42 +246,61 @@ gcloud run deploy "$SERVICE" \
   --execution-environment gen2 \
   --add-volume "name=data,type=cloud-storage,bucket=${BUCKET}" \
   --add-volume-mount "volume=data,mount-path=/data" \
-  --set-env-vars "PATENTKIT_PROVIDER=anthropic,PATENTKIT_INDEX_JSONL=/data/corpus.jsonl,PATENTKIT_SESSION_DIR=/data/sessions" \
-  --set-secrets "ANTHROPIC_API_KEY=${KEY_SECRET}:latest,PATENTKIT_MCP_TOKEN=${TOKEN_SECRET}:latest"
+  --set-env-vars "$ENV_VARS" \
+  --set-secrets "$SECRETS"
 
 SERVICE_URL="$(gcloud run services describe "$SERVICE" \
   --region "$REGION" --project "$PROJECT" --format 'value(status.url)')"
 
 # ----------------------------------------------------------------- summary
-cat <<EOF
+echo
+echo "============================================================"
+echo "patentkit MCP server deployed."
+echo
+echo "Service URL:    ${SERVICE_URL}"
+echo "MCP endpoint:   ${SERVICE_URL}/mcp"
+echo
+if [[ "$AUTH_MODE" == "oauth-google" ]]; then
+  cat <<EOF
+Auth: Google sign-in (allowlist: ${ALLOWED_EMAILS}).
 
-============================================================
-patentkit MCP server deployed.
+In the Google Cloud console, the OAuth web client's Authorized redirect URI
+MUST be exactly:
+  ${SERVICE_URL}/auth/google/callback
 
-Service URL:    ${SERVICE_URL}
-MCP endpoint:   ${SERVICE_URL}/mcp
+claude.ai connector (Settings -> Connectors -> Add custom connector):
+  Name: patentkit
+  Remote MCP server URL: ${SERVICE_URL}/mcp
+  Leave OAuth Client ID / Secret BLANK — claude.ai discovers the auth server
+  and registers itself; you'll sign in with Google on first use.
+
+Verify discovery (expects JSON metadata with authorize/token endpoints):
+  curl -sS "${SERVICE_URL}/.well-known/oauth-authorization-server"
+EOF
+else
+  cat <<EOF
 Access token:   ${MCP_TOKEN}
 
 claude.ai connector URL (Settings -> Connectors -> Add custom connector):
-
   ${SERVICE_URL}/mcp?token=${MCP_TOKEN}
 
-(Prefer sending the token as an "Authorization: Bearer" header if your
-client supports it; the ?token= form works everywhere but shows up in URLs.)
+(For stronger auth, redeploy with AUTH_MODE=oauth-google — Google sign-in,
+no token in the URL.)
 
 Verify the server answers (expects an "initialize" result, not a 401):
-
   curl -sS "${SERVICE_URL}/mcp" -X POST \\
     -H "Authorization: Bearer ${MCP_TOKEN}" \\
     -H "Content-Type: application/json" \\
     -H "Accept: application/json, text/event-stream" \\
     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}'
+EOF
+fi
+cat <<EOF
 
 Costs: the service scales to zero when idle (~\$0); LLM calls bill to your
 Anthropic key. Tear down with:
   gcloud run services delete ${SERVICE} --region ${REGION} --project ${PROJECT}
   gsutil rm -r gs://${BUCKET}
   gcloud secrets delete ${KEY_SECRET} --project ${PROJECT}
-  gcloud secrets delete ${TOKEN_SECRET} --project ${PROJECT}
 ============================================================
 EOF

@@ -17,6 +17,12 @@ Environment configuration (in addition to the variables documented in
 - ``PATENTKIT_MCP_TOKEN``  if set, every HTTP request must carry
   ``Authorization: Bearer <token>`` (or ``?token=<token>``) or it is rejected
   with 401. Always set this before exposing the server through a tunnel.
+- ``PATENTKIT_AUTH_MODE``  ``token`` (default — the static bearer path above) or
+  ``oauth-google`` (Google-delegated, email-allowlisted OAuth; see
+  :mod:`patentkit.integrations.mcp_oauth` for its environment variables). In
+  ``oauth-google`` mode the app mounts the OAuth metadata/authorize/token/
+  register/revoke routes, a ``/auth/google/callback`` route, protected-resource
+  metadata, and the SDK's bearer-auth middleware gating ``/mcp``.
 
 Requires the ``mcp-http`` extra: ``pip install 'patentkit[mcp-http]'``.
 """
@@ -37,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8765
 MCP_PATH = "/mcp"
+GOOGLE_CALLBACK_PATH = "/auth/google/callback"
 
 _INSTALL_HINT = (
     "patentkit's MCP streamable-http transport requires the 'mcp-http' extra "
@@ -91,25 +98,11 @@ class BearerAuthMiddleware:
         return any(hmac.compare_digest(candidate, self._token) for candidate in query.get("token", []))
 
 
-def build_http_app(
-    toolset: Any = None,
-    *,
-    token: str | None = None,
-    json_response: bool = False,
-    stateless: bool = False,
-) -> Any:
-    """Build the ASGI app serving the patentkit MCP server at ``/mcp``.
-
-    The MCP endpoint is also mirrored at ``/`` so a bare tunnel URL works.
-    If ``token`` is given the whole app is wrapped in
-    :class:`BearerAuthMiddleware`.
-    """
-    try:
-        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager  # noqa: PLC0415
-        from starlette.applications import Starlette  # noqa: PLC0415
-        from starlette.routing import Route  # noqa: PLC0415
-    except ImportError as exc:
-        raise ImportError(_INSTALL_HINT) from exc
+def _build_streamable_manager(
+    toolset: Any, *, json_response: bool, stateless: bool
+) -> tuple[Any, Any]:
+    """Return ``(endpoint, lifespan)`` for the StreamableHTTP session manager."""
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager  # noqa: PLC0415
 
     if toolset is None:
         toolset = build_toolset()
@@ -129,7 +122,31 @@ def build_http_app(
         async with manager.run():
             yield
 
-    endpoint = _StreamableHTTPEndpoint()
+    return _StreamableHTTPEndpoint(), lifespan
+
+
+def build_http_app(
+    toolset: Any = None,
+    *,
+    token: str | None = None,
+    json_response: bool = False,
+    stateless: bool = False,
+) -> Any:
+    """Build the ASGI app serving the patentkit MCP server at ``/mcp``.
+
+    The MCP endpoint is also mirrored at ``/`` so a bare tunnel URL works.
+    If ``token`` is given the whole app is wrapped in
+    :class:`BearerAuthMiddleware`.
+    """
+    try:
+        from starlette.applications import Starlette  # noqa: PLC0415
+        from starlette.routing import Route  # noqa: PLC0415
+    except ImportError as exc:
+        raise ImportError(_INSTALL_HINT) from exc
+
+    endpoint, lifespan = _build_streamable_manager(
+        toolset, json_response=json_response, stateless=stateless
+    )
     app: Any = Starlette(
         routes=[Route(MCP_PATH, endpoint=endpoint), Route("/", endpoint=endpoint)],
         lifespan=lifespan,
@@ -137,6 +154,117 @@ def build_http_app(
     if token:
         app = BearerAuthMiddleware(app, token)
     return app
+
+
+def build_oauth_http_app(
+    toolset: Any = None,
+    *,
+    config: Any = None,
+    provider: Any = None,
+    json_response: bool = False,
+    stateless: bool = False,
+) -> Any:
+    """Build the ASGI app for ``oauth-google`` mode (patentkit as OAuth AS).
+
+    Mounts, alongside the StreamableHTTP ``/mcp`` route:
+
+    - OAuth AS metadata + ``/authorize`` + ``/token`` + ``/register`` + ``/revoke``
+      (:func:`mcp.server.auth.routes.create_auth_routes`),
+    - ``/auth/google/callback`` (the upstream-IdP return leg),
+    - RFC 9728 protected-resource metadata, and
+    - the SDK bearer-auth middleware (``AuthenticationMiddleware`` +
+      ``BearerAuthBackend``) plus ``RequireAuthMiddleware`` gating ``/mcp`` on a
+      valid Google-derived access JWT.
+
+    ``config``/``provider`` are injectable for tests; otherwise built from env.
+    """
+    try:
+        from mcp.server.auth.middleware.auth_context import AuthContextMiddleware  # noqa: PLC0415
+        from mcp.server.auth.middleware.bearer_auth import (  # noqa: PLC0415
+            BearerAuthBackend,
+            RequireAuthMiddleware,
+        )
+        from mcp.server.auth.routes import (  # noqa: PLC0415
+            build_resource_metadata_url,
+            create_auth_routes,
+            create_protected_resource_routes,
+        )
+        from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions  # noqa: PLC0415
+        from pydantic import AnyHttpUrl  # noqa: PLC0415
+        from starlette.applications import Starlette  # noqa: PLC0415
+        from starlette.middleware import Middleware  # noqa: PLC0415
+        from starlette.middleware.authentication import AuthenticationMiddleware  # noqa: PLC0415
+        from starlette.responses import HTMLResponse, RedirectResponse  # noqa: PLC0415
+        from starlette.routing import Route  # noqa: PLC0415
+    except ImportError as exc:
+        raise ImportError(_INSTALL_HINT) from exc
+
+    from patentkit.integrations.mcp_oauth import (  # noqa: PLC0415
+        PatentkitGoogleOAuthProvider,
+        PatentkitTokenVerifier,
+        load_oauth_config,
+    )
+
+    if config is None:
+        config = load_oauth_config()
+    if provider is None:
+        provider = PatentkitGoogleOAuthProvider(config)
+    verifier = PatentkitTokenVerifier(provider)
+
+    issuer_url = AnyHttpUrl(config.issuer)
+    resource_url = AnyHttpUrl(config.resource_url)
+    scopes = ["patentkit"]
+
+    endpoint, lifespan = _build_streamable_manager(
+        toolset, json_response=json_response, stateless=stateless
+    )
+
+    async def google_callback(request: Any) -> Any:
+        code = request.query_params.get("code")
+        state = request.query_params.get("state")
+        redirect_url, error = await provider.complete_google_callback(code, state)
+        if redirect_url:
+            return RedirectResponse(url=redirect_url, status_code=302, headers={"Cache-Control": "no-store"})
+        if error == "access_denied":
+            return HTMLResponse(
+                "<h1>Not authorized</h1><p>This Google account is not on the "
+                "allowlist for this patentkit server.</p>",
+                status_code=403,
+            )
+        return HTMLResponse(
+            "<h1>Sign-in failed</h1><p>The authorization request could not be "
+            "completed. Please try connecting again.</p>",
+            status_code=400,
+        )
+
+    resource_metadata_url = build_resource_metadata_url(resource_url)
+
+    routes = create_auth_routes(
+        provider=provider,
+        issuer_url=issuer_url,
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True, valid_scopes=scopes, default_scopes=scopes
+        ),
+        revocation_options=RevocationOptions(enabled=True),
+    )
+    routes.append(Route(GOOGLE_CALLBACK_PATH, endpoint=google_callback, methods=["GET"]))
+    routes.extend(
+        create_protected_resource_routes(
+            resource_url=resource_url,
+            authorization_servers=[issuer_url],
+            scopes_supported=scopes,
+        )
+    )
+    gated = RequireAuthMiddleware(endpoint, scopes, resource_metadata_url)
+    routes.append(Route(MCP_PATH, endpoint=gated))
+    routes.append(Route("/", endpoint=gated))
+
+    middleware = [
+        Middleware(AuthenticationMiddleware, backend=BearerAuthBackend(verifier)),
+        Middleware(AuthContextMiddleware),
+    ]
+
+    return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
 
 def serve_http(*, host: str | None = None, port: int | None = None) -> None:
@@ -149,15 +277,26 @@ def serve_http(*, host: str | None = None, port: int | None = None) -> None:
     host = host or os.environ.get("PATENTKIT_MCP_HOST") or "127.0.0.1"
     if port is None:
         port = int(os.environ.get("PATENTKIT_MCP_PORT") or DEFAULT_PORT)
-    token = os.environ.get("PATENTKIT_MCP_TOKEN") or None
 
-    app = build_http_app(token=token)
-    logger.info(
-        "patentkit-mcp: streamable-http transport listening on http://%s:%d%s "
-        "(bearer auth: %s)",
-        host,
-        port,
-        MCP_PATH,
-        "ON" if token else "OFF — set PATENTKIT_MCP_TOKEN before exposing this server publicly",
-    )
+    auth_mode = (os.environ.get("PATENTKIT_AUTH_MODE") or "token").strip().lower()
+    if auth_mode == "oauth-google":
+        app = build_oauth_http_app()
+        logger.info(
+            "patentkit-mcp: streamable-http transport listening on http://%s:%d%s "
+            "(auth: oauth-google — Google sign-in, email allowlist)",
+            host,
+            port,
+            MCP_PATH,
+        )
+    else:
+        token = os.environ.get("PATENTKIT_MCP_TOKEN") or None
+        app = build_http_app(token=token)
+        logger.info(
+            "patentkit-mcp: streamable-http transport listening on http://%s:%d%s "
+            "(bearer auth: %s)",
+            host,
+            port,
+            MCP_PATH,
+            "ON" if token else "OFF — set PATENTKIT_MCP_TOKEN before exposing this server publicly",
+        )
     uvicorn.run(app, host=host, port=port, log_config=None)

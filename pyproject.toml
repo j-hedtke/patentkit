@@ -23,7 +23,9 @@ viz = ["scikit-learn>=1.4", "numpy>=1.26", "matplotlib>=3.8"]
 mcp = ["mcp>=1.2"]
 # streamable-http transport (claude.ai custom connectors): mcp>=1.8 ships
 # StreamableHTTPSessionManager; starlette/uvicorn are imported directly.
-mcp-http = ["mcp>=1.8", "starlette>=0.40", "uvicorn>=0.30"]
+# pyjwt+cryptography: verify Google's RS256 id_token via JWKS and sign/verify
+# the HS256 access/refresh tokens patentkit issues in oauth-google auth mode.
+mcp-http = ["mcp>=1.8", "starlette>=0.40", "uvicorn>=0.30", "pyjwt>=2.8", "cryptography>=42"]
 scrape = ["beautifulsoup4>=4.12", "lxml>=5.0"]
 all = [
     "patentkit[anthropic,openai,elasticsearch,docx,pdf,viz,mcp,mcp-http,scrape]",
