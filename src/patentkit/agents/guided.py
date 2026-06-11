@@ -167,6 +167,7 @@ class GuidedSearch:
         product_description: Optional[str] = None,
         claims: Optional[list[int]] = None,
         fetch: Optional[Callable[[str], Patent]] = None,
+        key_limitations: Optional[list[str] | str] = None,
     ) -> GuidedSearchSession:
         """Create a session and plan it; state becomes awaiting_plan_feedback.
 
@@ -178,12 +179,16 @@ class GuidedSearch:
             product_description: target product (fto / infringement context).
             claims: claim numbers in focus.
             fetch: optional ``number -> Patent`` resolver override.
+            key_limitations: claim limitations to prioritize (e.g. those
+                added/argued for allowance per the file wrapper); injected
+                into the agent's task context on the first execution.
         """
         patent: Optional[Patent] = None
         if target_patent_number:
             patent = self._resolve_patent(target_patent_number, fetch)
         return self.start_with_patent(search_type, patent,
-                                      product_description=product_description, claims=claims)
+                                      product_description=product_description, claims=claims,
+                                      key_limitations=key_limitations)
 
     def start_with_patent(
         self,
@@ -192,6 +197,7 @@ class GuidedSearch:
         *,
         product_description: Optional[str] = None,
         claims: Optional[list[int]] = None,
+        key_limitations: Optional[list[str] | str] = None,
     ) -> GuidedSearchSession:
         """Like :meth:`start` but with an already-resolved :class:`Patent`.
 
@@ -213,6 +219,7 @@ class GuidedSearch:
                 "patent": patent.model_dump(mode="json") if patent else None,
                 "claims": claims,
                 "product_description": product_description,
+                "key_limitations": _normalize_key_limitations(key_limitations),
                 "estimated_seconds": estimated,
                 "estimated_human": humanize_seconds(estimated),
                 "pending_feedback": [],
@@ -260,16 +267,28 @@ class GuidedSearch:
 
     # --------------------------------------------------------------- execute
     def execute(self, session: GuidedSearchSession,
-                progress: Optional[Callable[[str], None]] = None) -> GuidedSearchSession:
+                progress: Optional[Callable[[str], None]] = None,
+                *,
+                budget_seconds: Optional[float] = None,
+                max_steps: Optional[int] = None) -> GuidedSearchSession:
         """Run (or resume) the agentic search for this session.
 
         First execution starts a fresh agent conversation seeded with the
-        plan's starting angles and any pre-run guidance; later executions
-        resume the persisted conversation with the queued feedback messages
-        injected. The reasoning trace lands in ``session.params["trace"]``,
-        the resumable conversation in ``session.params["conversation"]``,
-        ranked results in ``session.last_results``, and the full agent
-        result model in ``session.params["result"]``.
+        plan's starting angles, any key limitations, and pre-run guidance;
+        later executions resume the persisted conversation with the queued
+        feedback messages injected. The reasoning trace lands in
+        ``session.params["trace"]``, the resumable conversation in
+        ``session.params["conversation"]``, ranked results in
+        ``session.last_results``, and the full agent result model in
+        ``session.params["result"]``.
+
+        Args:
+            session: the session to execute or resume.
+            progress: optional callback receiving human-readable updates.
+            budget_seconds: optional per-execution wall-clock override —
+                pass a small value to get short rounds the user can steer
+                between with feedback.
+            max_steps: optional per-execution agent-round override.
         """
         if session.plan is None:
             raise ValueError(f"Session {session.id} has no plan; call start() first")
@@ -277,6 +296,14 @@ class GuidedSearch:
             raise ValueError(f"Session {session.id} is already done")
         session.state = "searching"
         t0 = time.monotonic()
+
+        budget_overrides: dict = {}
+        if budget_seconds is not None:
+            budget_overrides["budget_seconds"] = float(budget_seconds)
+        if max_steps is not None:
+            budget_overrides["max_steps"] = int(max_steps)
+        if budget_overrides:
+            session.params["budget_overrides"] = dict(budget_overrides)
 
         corpus = len(self.keyword_store) if self.keyword_store is not None else 0
         session.params["estimated_seconds"] = estimate_search_seconds(
@@ -295,7 +322,7 @@ class GuidedSearch:
                 patent, claims=session.params.get("claims"),
                 custom_exclusions=session.plan.exclusions,
                 feedback_messages=feedback_messages, resume_messages=resume,
-                progress=progress,
+                progress=progress, **budget_overrides,
             )
         elif session.search_type == "fto":
             description = session.params.get("product_description")
@@ -305,7 +332,7 @@ class GuidedSearch:
             result = agent.search(
                 description, custom_exclusions=session.plan.exclusions,
                 feedback_messages=feedback_messages, resume_messages=resume,
-                progress=progress,
+                progress=progress, **budget_overrides,
             )
         else:  # infringement
             if patent is None:
@@ -315,9 +342,10 @@ class GuidedSearch:
                 patent, claims=session.params.get("claims"),
                 product_candidates=session.params.get("product_candidates"),
                 feedback_messages=feedback_messages, resume_messages=resume,
-                progress=progress,
+                progress=progress, **budget_overrides,
             )
 
+        session.params["executions"] = int(session.params.get("executions") or 0) + 1
         session.last_results = result.results
         dump = result.model_dump(mode="json")
         session.params["conversation"] = dump.pop("conversation", None)
@@ -339,12 +367,19 @@ class GuidedSearch:
         """Consume queued pre-run guidance + result feedback for injection."""
         messages: list[str] = []
         if not session.params.get("conversation"):
-            # first run: seed the agent with the plan's angles + plan feedback
+            # first run: seed the agent with the plan's angles, key
+            # limitations, and plan feedback
             plan = session.plan
             if plan is not None and plan.queries:
                 angles = "; ".join(
                     f"{q.purpose}: {', '.join(q.query.keywords[:8])}" for q in plan.queries)
                 messages.append("Suggested starting angles (from the reviewed plan): " + angles)
+            key_limitations = session.params.get("key_limitations") or []
+            if key_limitations:
+                messages.append(
+                    "Key claim limitations to prioritize (e.g. added or argued "
+                    "for allowance — the strongest prior art should disclose "
+                    "these):\n" + "\n".join(f"- {k}" for k in key_limitations))
             messages += session.params.get("pre_run_guidance") or []
             session.params["pre_run_guidance"] = []
         messages += session.params.get("pending_feedback") or []
@@ -361,6 +396,16 @@ class GuidedSearch:
         """The persisted reasoning trace of the last execution, if any."""
         dump = session.params.get("trace")
         return SearchTrace.model_validate(dump) if dump else None
+
+
+def _normalize_key_limitations(key_limitations: Optional[list[str] | str]) -> list[str]:
+    """Accept a list of limitation strings or one text blob; drop blanks."""
+    if key_limitations is None:
+        return []
+    if isinstance(key_limitations, str):
+        text = key_limitations.strip()
+        return [text] if text else []
+    return [str(k).strip() for k in key_limitations if str(k).strip()]
 
 
 def restore_session(payload: str | dict) -> GuidedSearchSession:

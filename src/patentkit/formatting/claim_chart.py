@@ -10,14 +10,20 @@ from __future__ import annotations
 
 import html as _html
 import logging
-from typing import Optional
+from typing import Optional, Sequence
 
 from patentkit.analysis.invalidity import ClaimChart, DisclosureFinding, ReferenceChart
 from patentkit.models import AtomicLimitation
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["claim_chart_markdown", "claim_chart_html", "claim_chart_docx"]
+__all__ = [
+    "claim_chart_markdown",
+    "claim_chart_html",
+    "claim_chart_docx",
+    "filter_chart",
+    "limitation_chart_markdown",
+]
 
 _STATUS_LABEL = {
     "disclosed": "Disclosed",
@@ -90,6 +96,66 @@ def claim_chart_markdown(chart: ClaimChart) -> str:
     for number, fraction in chart.coverage_summary().items():
         lines.append(f"- {number}: {fraction:.0%} of limitations disclosed")
     lines.append(f"- Combined (any reference): {chart.combined_coverage():.0%}")
+    return "\n".join(lines)
+
+
+def filter_chart(chart: ClaimChart, limitation_substrings: Sequence[str]) -> ClaimChart:
+    """Copy of ``chart`` restricted to limitations matching any substring.
+
+    Matching is case-insensitive substring containment against each
+    limitation's text. The returned chart's coverage figures reflect only the
+    retained rows. Limitations matching nothing are dropped; an empty filter
+    list returns the chart unchanged.
+    """
+    wanted = [str(s).strip().lower() for s in limitation_substrings if str(s).strip()]
+    if not wanted:
+        return chart
+    matched = [lim for lim in chart.limitations
+               if any(w in lim.text.lower() for w in wanted)]
+    texts = {lim.text for lim in matched}
+    references = [
+        ReferenceChart(
+            reference_number=ref.reference_number,
+            reference_title=ref.reference_title,
+            findings=[f for f in ref.findings if f.limitation.text in texts],
+        )
+        for ref in chart.references
+    ]
+    return ClaimChart(
+        query_patent=chart.query_patent,
+        claim_number=chart.claim_number,
+        interpreted_claim=chart.interpreted_claim,
+        limitations=matched,
+        references=references,
+    )
+
+
+def limitation_chart_markdown(chart: ClaimChart, limitation: AtomicLimitation) -> str:
+    """Render one limitation's disclosure across references: one row per
+    reference with status, reasoning, and quotes/citation."""
+    lines = [
+        f"## Limitation Chart — {chart.query_patent}, Claim {chart.claim_number}",
+        "",
+        f"**Limitation:** {_md_escape(limitation.text)}",
+        "",
+        "| Reference | Status | Reasoning | Quotes |",
+        "| --- | --- | --- | --- |",
+    ]
+    for ref in chart.references:
+        finding = next((f for f in ref.findings if f.limitation.text == limitation.text), None)
+        if finding is None:
+            lines.append(f"| {_md_escape(_ref_header(ref))} | — | — | — |")
+            continue
+        quotes = []
+        for i, quote in enumerate(finding.quotes):
+            cite = f" ({finding.citation})" if finding.citation and i == 0 else ""
+            quotes.append(f"“{_md_escape(quote)}”{cite}")
+        lines.append(
+            f"| {_md_escape(_ref_header(ref))} "
+            f"| **{_STATUS_LABEL[finding.status]}** "
+            f"| {_md_escape(finding.reasoning) or '—'} "
+            f"| {'<br>'.join(quotes) or '—'} |"
+        )
     return "\n".join(lines)
 
 

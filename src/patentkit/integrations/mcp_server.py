@@ -11,6 +11,7 @@ Environment configuration:
 - ``PATENTKIT_PROVIDER``      "anthropic" or "openai" — LLM for planning/reranking
 - ``PATENTKIT_SESSION_DIR``   directory for guided-session JSON persistence
 - ``PATENTKIT_INDEX_JSONL``   a .jsonl corpus of Patent records preloaded at startup
+- ``USPTO_ODP_API_KEY``       enables file-wrapper context in summarize_key_limitations
 
 Requires the ``mcp`` extra: ``pip install 'patentkit[mcp]'``.
 """

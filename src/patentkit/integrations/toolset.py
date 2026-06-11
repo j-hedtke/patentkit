@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import date
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Union
 
 from patentkit.agents.feedback import SearchFeedback
 from patentkit.agents.guided import GuidedSearch, GuidedSearchSession, SessionStore
@@ -33,6 +34,32 @@ from patentkit.search.base import SearchResult
 from patentkit.search.bm25 import BM25Store
 
 logger = logging.getLogger(__name__)
+
+#: cap on prosecution-history text fed to the key-limitations summarizer
+_WRAPPER_CHAR_CAP = 60_000
+
+_KEY_LIMITATIONS_PROMPT = """\
+You are a patent prosecution analyst. Identify the claim limitations that \
+secured allowance of this claim — limitations ADDED BY AMENDMENT or ARGUED \
+by the applicant to distinguish the prior art. These are the prime targets \
+of an invalidity search.
+
+Patent {patent}, claim {claim_number}:
+{claim}
+
+Atomic limitations of the claim:
+{limitations}
+
+Prosecution-history excerpts (office actions, applicant remarks, notice of \
+allowance), oldest first:
+{wrapper}
+
+Respond with JSON only:
+{{"key_limitations": [{{"limitation": "<verbatim text of one limitation from \
+the list above>", "why": "<one sentence: added/argued and against what \
+rejection or art>"}}], "summary": "<2-3 sentence narrative of how the claim \
+was allowed>"}}
+"""
 
 
 def _result_dict(result: SearchResult) -> dict:
@@ -78,6 +105,57 @@ def _session_dict(session: GuidedSearchSession) -> dict:
     }
 
 
+def _progress_markdown(session: GuidedSearchSession) -> str:
+    """Short chat-ready progress summary rendered after each execution round.
+
+    Ground-truth-agnostic: candidates are listed with the agent's own "why",
+    never with relevance verdicts. Degraded keys-free runs are labeled.
+    """
+    result = session.params.get("result") or {}
+    mode = (result.get("plan_or_params") or {}).get("mode")
+    trace = session.params.get("trace") or {}
+    queries = trace.get("queries") or []
+    round_number = int(session.params.get("executions") or 0) or 1
+    lines = [
+        f"### Guided search — round {round_number} complete (session `{session.id}`)",
+        "",
+        f"- Stop reason: `{session.params.get('stop_reason') or '?'}`; "
+        f"elapsed {session.params.get('elapsed_seconds')}s",
+    ]
+    if mode == "degraded_keyword_only":
+        lines.append("- Mode: DEGRADED keys-free keyword pass — not agentic-mode performance.")
+    if queries:
+        lines.append(f"- Queries issued this round ({len(queries)}):")
+        for query in queries[:8]:
+            arguments = json.dumps(query.get("arguments") or {}, default=str)
+            if len(arguments) > 160:
+                arguments = arguments[:160] + " …"
+            lines.append(f"  - `{query.get('tool', 'search')}` `{arguments}`")
+        if len(queries) > 8:
+            lines.append(f"  - … and {len(queries) - 8} more")
+    if session.last_results:
+        lines.append(f"- Current candidates ({len(session.last_results)}):")
+        for i, candidate in enumerate(session.last_results[:5], start=1):
+            number = candidate.get("patent_number", "?")
+            title = candidate.get("title") or ""
+            why = (candidate.get("why") or "").strip()
+            entry = f"  {i}. **{number}**" + (f" — {title}" if title else "")
+            if why:
+                entry += f" _({why[:120]})_"
+            lines.append(entry)
+        if len(session.last_results) > 5:
+            lines.append(f"  - … and {len(session.last_results) - 5} more")
+    else:
+        lines.append("- No candidates yet.")
+    lines += [
+        "",
+        "_Send `guided_search_feedback` to steer the next round, or call "
+        "`guided_search_execute` again to continue this same agent "
+        "conversation._",
+    ]
+    return "\n".join(lines)
+
+
 class PatentToolset:
     """Every patentkit capability behind one JSON-in / JSON-out surface.
 
@@ -103,6 +181,9 @@ class PatentToolset:
         self.notifiers = list(notifiers)
         self.sessions = SessionStore(session_dir)
         self._guided: Optional[GuidedSearch] = None
+        #: (normalized patent number, claim number) -> most recent ClaimChart,
+        #: so DOCX export never re-runs LLM calls
+        self._charts: dict[tuple[str, int], Any] = {}
 
     # ------------------------------------------------------------ internals
     @property
@@ -148,6 +229,26 @@ class PatentToolset:
         if session is None:
             raise LookupError(f"No guided session with id {session_id!r}")
         return session
+
+    @staticmethod
+    def _chart_key(patent_number: str, claim_number: int) -> tuple[str, int]:
+        """Cache key, kind-code-agnostic (US7000001B1 == US7000001)."""
+        try:
+            parsed = PatentNumber.parse(str(patent_number))
+            normalized = f"{parsed.country_code}{parsed.number.lstrip('0') or '0'}"
+        except ValueError:
+            normalized = str(patent_number).strip().upper()
+        return normalized, int(claim_number)
+
+    def _cache_chart(self, chart: Any) -> None:
+        try:
+            key = self._chart_key(chart.query_patent, chart.claim_number)
+        except (AttributeError, ValueError, TypeError):
+            return
+        self._charts[key] = chart
+
+    def _cached_chart(self, patent_number: str, claim_number: int) -> Optional[Any]:
+        return self._charts.get(self._chart_key(patent_number, claim_number))
 
     # ----------------------------------------------------------------- tools
     def search_patents(
@@ -237,11 +338,14 @@ class PatentToolset:
 
     def guided_search_start(self, search_type: str, patent_number: Optional[str] = None,
                             product_description: Optional[str] = None,
-                            claims: Optional[list[int]] = None) -> dict:
+                            claims: Optional[list[int]] = None,
+                            key_limitations: Optional[Union[list[str], str]] = None) -> dict:
         """Start a guided patent search session. search_type is 'invalidity'
         (prior art against a patent — needs patent_number), 'fto' (freedom to
         operate — needs product_description), or 'infringement' (needs
-        patent_number). Returns a session_id, a preview of the starting query
+        patent_number). Optional key_limitations (e.g. from
+        summarize_key_limitations) are injected into the executing agent's
+        task context. Returns a session_id, a preview of the starting query
         angles (the executing agent generates and refines its own queries),
         and an up-front time estimate; present the preview to the user and
         collect feedback before executing."""
@@ -250,6 +354,7 @@ class PatentToolset:
                 search_type, target_patent_number=patent_number,  # type: ignore[arg-type]
                 product_description=product_description, claims=claims,
                 fetch=self._fetch_patent if patent_number else None,
+                key_limitations=key_limitations,
             )
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc)}
@@ -275,18 +380,23 @@ class PatentToolset:
             return {"error": str(exc)}
         return _session_dict(session)
 
-    def guided_search_execute(self, session_id: str) -> dict:
+    def guided_search_execute(self, session_id: str,
+                              budget_seconds: Optional[float] = None,
+                              max_steps: Optional[int] = None) -> dict:
         """Execute (or resume) a guided session's agentic search: one LLM
         agent issues and refines its own queries via tool use under a time
         budget; queued feedback is injected into the resumed conversation.
-        Returns ranked results, what was excluded and why, timing, the stop
-        reason, and a trace summary (use get_search_trace for the full
-        reasoning trace). May take the estimated time reported by
-        guided_search_start. Without an LLM it runs a clearly-labeled
-        degraded single keyword pass."""
+        Optional budget_seconds / max_steps override the per-round budgets —
+        pass small values for short rounds the user can steer between with
+        guided_search_feedback. Returns ranked results, what was excluded and
+        why, timing, the stop reason, a trace summary (full trace via
+        get_search_trace), and a chat-ready 'progress' markdown summary.
+        Without an LLM it runs a clearly-labeled degraded single keyword
+        pass."""
         try:
             session = self._require_session(session_id)
-            session = self.guided.execute(session)
+            session = self.guided.execute(session, budget_seconds=budget_seconds,
+                                          max_steps=max_steps)
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc)}
         out = _session_dict(session)
@@ -294,6 +404,7 @@ class PatentToolset:
         result = session.params.get("result") or {}
         out["excluded"] = result.get("excluded", {})
         out["timing"] = result.get("timing", {})
+        out["progress"] = _progress_markdown(session)
         if self.notifiers:
             try:
                 from patentkit.notify.base import notify_search_complete  # noqa: PLC0415
@@ -318,9 +429,12 @@ class PatentToolset:
 
     def get_search_trace(self, session_id: str) -> dict:
         """Get the full reasoning trace of a guided session's last agentic
-        execution: the human-readable markdown trace, every query the agent
-        issued, and the shortlist evolution. Show this to the user so they
-        can give feedback on specific queries and results."""
+        execution. The 'markdown' field is a chat-ready narrative — one
+        section per agent round with its thinking, queries (inline code),
+        result counts, shortlist updates, injected feedback, and the stop
+        reason — plus the raw queries and shortlist history. Show the
+        markdown to the user so they can give feedback on specific queries
+        and results."""
         try:
             session = self._require_session(session_id)
         except LookupError as exc:
@@ -329,9 +443,10 @@ class PatentToolset:
         if trace is None:
             return {"error": f"Session {session_id} has no persisted trace yet "
                              "(execute it first; degraded keys-free runs have no trace)."}
+        from patentkit.formatting.trace import search_trace_markdown  # noqa: PLC0415
         return {
             "session_id": session_id,
-            "markdown": trace.to_markdown(),
+            "markdown": search_trace_markdown(trace),
             "queries": trace.queries,
             "shortlist_history": trace.shortlist_history,
             "feedback": trace.feedback,
@@ -363,10 +478,15 @@ class PatentToolset:
                 "corpus_size": corpus_size, "llm_rerank": self.llm is not None}
 
     def build_claim_chart(self, patent_number: str, claim_number: int,
-                          reference_numbers: list[str]) -> dict:
+                          reference_numbers: list[str],
+                          limitations_filter: Optional[list[str]] = None) -> dict:
         """Build an element-by-element invalidity claim chart mapping one claim
-        of the target patent against the given prior-art references. Requires
-        the patentkit analysis module; references must be fetchable."""
+        of the target patent against the given prior-art references (works
+        with a single reference too). The result includes a ready-to-display
+        'markdown' field; an optional limitations_filter (limitation-text
+        substrings) restricts the markdown to the matching rows. The chart is
+        cached for export_claim_chart_docx. Requires the patentkit analysis
+        module; references must be fetchable."""
         try:
             from patentkit.analysis.invalidity import build_claim_chart  # noqa: PLC0415
         except ImportError:
@@ -375,19 +495,326 @@ class PatentToolset:
         try:
             patent = self._fetch_patent(patent_number)
             references = [self._fetch_patent(n) for n in reference_numbers]
-            chart = build_claim_chart(patent, claim_number, references, self.llm)
+            reference_texts = [(str(p.patent_number), p.text_for_search()) for p in references]
+            chart = build_claim_chart(patent, claim_number, reference_texts, self.llm)
+            for reference_chart, ref in zip(chart.references, references):
+                reference_chart.reference_title = reference_chart.reference_title or ref.title
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc)}
-        data: dict[str, Any]
-        if hasattr(chart, "model_dump"):
-            data = chart.model_dump(mode="json")
-        else:
-            data = {k: str(v) for k, v in vars(chart).items() if not k.startswith("_")}
+        self._cache_chart(chart)
+        data: dict[str, Any] = chart.model_dump(mode="json")
         try:
             data["coverage_summary"] = chart.coverage_summary()
         except Exception as exc:  # noqa: BLE001
             data["coverage_summary"] = f"unavailable: {exc}"
+        data["markdown"] = self._chart_markdown(chart, limitations_filter)
         return data
+
+    def _chart_markdown(self, chart: Any, limitations_filter: Optional[list[str]]) -> str:
+        """Display markdown for a chart, optionally filtered to key rows."""
+        try:
+            from patentkit.formatting.claim_chart import (  # noqa: PLC0415
+                claim_chart_markdown,
+                filter_chart,
+            )
+        except ImportError as exc:  # pragma: no cover — formatting ships with core
+            return f"(markdown rendering unavailable: {exc})"
+        if limitations_filter:
+            filtered = filter_chart(chart, limitations_filter)
+            if filtered.limitations:
+                note = (f"_Filtered to {len(filtered.limitations)} of "
+                        f"{len(chart.limitations)} limitation(s) matching "
+                        f"{limitations_filter!r}; coverage figures reflect the "
+                        "filtered rows._\n\n")
+                return note + claim_chart_markdown(filtered)
+            return (f"_limitations_filter {limitations_filter!r} matched no "
+                    "limitations; showing the full chart._\n\n"
+                    + claim_chart_markdown(chart))
+        return claim_chart_markdown(chart)
+
+    def chart_limitation(self, limitation: str, patent: str, claim_number: int,
+                         references: list[str]) -> dict:
+        """Chart ONE claim limitation across one or more references: returns a
+        markdown table with one row per reference (disclosure status,
+        reasoning, quotes, citation). Reuses disclosure assessments cached by
+        a previous build_claim_chart / chart_limitation call when available;
+        only missing (limitation, reference) pairs are assessed. The merged
+        chart is cached for export_claim_chart_docx."""
+        try:
+            from patentkit.analysis.claims_analysis import split_atomic_limitations  # noqa: PLC0415
+            from patentkit.analysis.invalidity import (  # noqa: PLC0415
+                ClaimChart,
+                ReferenceChart,
+                assess_reference,
+            )
+            from patentkit.formatting.claim_chart import limitation_chart_markdown  # noqa: PLC0415
+        except ImportError:
+            return {"error": "Limitation charting requires patentkit.analysis "
+                             "(not available in this installation)."}
+        if not references:
+            return {"error": "chart_limitation requires at least one reference number."}
+        try:
+            target = self._fetch_patent(patent)
+        except (LookupError, ValueError) as exc:
+            return {"error": str(exc)}
+        claim = target.get_claim(int(claim_number))
+        if claim is None:
+            return {"error": f"Claim {claim_number} not found in {target.patent_number}"}
+
+        cached = self._cached_chart(patent, claim_number)
+        try:
+            limitations = ((cached.limitations if cached is not None else None)
+                           or claim.atomic_limitations
+                           or split_atomic_limitations(claim, target, llm=self.llm))
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"Could not split claim {claim_number} into limitations: {exc}"}
+        needle = " ".join(str(limitation).split()).lower()
+        match = next(
+            (lim for lim in limitations
+             if needle in " ".join(lim.text.split()).lower()
+             or " ".join(lim.text.split()).lower() in needle),
+            None,
+        )
+        if match is None:
+            return {"error": f"No limitation of claim {claim_number} matches "
+                             f"{limitation!r}. Limitations: "
+                             + "; ".join(lim.text for lim in limitations)}
+
+        reference_charts: list[Any] = []
+        reused: list[str] = []
+        assessed: list[str] = []
+        for number in references:
+            try:
+                normalized = str(PatentNumber.parse(str(number)))
+            except ValueError:
+                normalized = str(number)
+            finding = None
+            cached_ref = None
+            if cached is not None:
+                cached_ref = next(
+                    (r for r in cached.references
+                     if self._chart_key(r.reference_number, 0)
+                     == self._chart_key(normalized, 0)),
+                    None,
+                )
+            if cached_ref is not None:
+                finding = next((f for f in cached_ref.findings
+                                if f.limitation.text == match.text), None)
+            if finding is not None:
+                reference_charts.append(ReferenceChart(
+                    reference_number=cached_ref.reference_number,
+                    reference_title=cached_ref.reference_title,
+                    findings=[finding],
+                ))
+                reused.append(cached_ref.reference_number)
+                continue
+            try:
+                ref_patent = self._fetch_patent(str(number))
+                reference_charts.append(assess_reference(
+                    [match], ref_patent.text_for_search(), str(ref_patent.patent_number),
+                    reference_title=ref_patent.title, llm=self.llm,
+                ))
+                assessed.append(str(ref_patent.patent_number))
+            except Exception as exc:  # noqa: BLE001
+                return {"error": f"Assessing {number} failed: {exc}"}
+
+        view = ClaimChart(query_patent=str(target.patent_number),
+                          claim_number=int(claim_number),
+                          limitations=[match], references=reference_charts)
+        self._merge_chart_into_cache(view, match)
+        return {
+            "patent": str(target.patent_number),
+            "claim_number": int(claim_number),
+            "limitation": match.text,
+            "references": [r.model_dump(mode="json") for r in reference_charts],
+            "reused_assessments": reused,
+            "new_assessments": assessed,
+            "markdown": limitation_chart_markdown(view, match),
+        }
+
+    def _merge_chart_into_cache(self, view: Any, limitation: Any) -> None:
+        """Merge a single-limitation chart into the cached chart for export."""
+        cached = self._cached_chart(view.query_patent, view.claim_number)
+        if cached is None:
+            self._cache_chart(view)
+            return
+        if all(lim.text != limitation.text for lim in cached.limitations):
+            cached.limitations.append(limitation)
+        for reference_chart in view.references:
+            key = self._chart_key(reference_chart.reference_number, 0)
+            existing = next((r for r in cached.references
+                             if self._chart_key(r.reference_number, 0) == key), None)
+            if existing is None:
+                cached.references.append(reference_chart)
+                continue
+            existing.findings = (
+                [f for f in existing.findings if f.limitation.text != limitation.text]
+                + list(reference_chart.findings)
+            )
+
+    def export_claim_chart_docx(self, patent: str, claim_number: int,
+                                out_path: Optional[str] = None) -> dict:
+        """Export the most recent claim chart for (patent, claim_number) —
+        built earlier via build_claim_chart or chart_limitation — as a
+        color-coded DOCX file, without re-running any LLM calls. Returns the
+        absolute path written. Requires the docx extra
+        (pip install 'patentkit[docx]')."""
+        chart = self._cached_chart(patent, claim_number)
+        if chart is None:
+            return {"error": f"No cached claim chart for {patent} claim {claim_number}. "
+                             "Build one first with build_claim_chart (or chart_limitation), "
+                             "then call export_claim_chart_docx again."}
+        try:
+            from patentkit.formatting.claim_chart import claim_chart_docx  # noqa: PLC0415
+        except ImportError as exc:
+            return {"error": f"DOCX export requires patentkit.formatting: {exc}"}
+        if out_path is None:
+            base = (self.sessions.directory or Path.cwd()) / "exports"
+            normalized, claim = self._chart_key(patent, claim_number)
+            out_path = str(base / f"claim_chart_{normalized}_claim{claim}.docx")
+        path = Path(out_path).expanduser().resolve()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            claim_chart_docx(chart, str(path))
+        except ImportError as exc:  # python-docx missing at runtime
+            return {"error": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"DOCX export failed: {exc}"}
+        return {"path": str(path), "patent": str(chart.query_patent),
+                "claim_number": int(chart.claim_number),
+                "limitations": len(chart.limitations),
+                "references": [r.reference_number for r in chart.references]}
+
+    def summarize_key_limitations(self, patent: str, claim_number: int) -> dict:
+        """Summarize the KEY limitations of one claim — the ones added by
+        amendment or argued for allowance per the prosecution history (the
+        prime targets of an invalidity search). With USPTO_ODP_API_KEY set
+        (or a file-wrapper-enriched record) the LLM reads the file wrapper;
+        without it, degrades to a plain claim split with a clear note. The
+        result includes display markdown, and key_limitations can be passed
+        straight to guided_search_start."""
+        try:
+            from patentkit.analysis.claims_analysis import split_atomic_limitations  # noqa: PLC0415
+        except ImportError:
+            return {"error": "summarize_key_limitations requires patentkit.analysis "
+                             "(not available in this installation)."}
+        try:
+            target = self._fetch_patent(patent)
+        except (LookupError, ValueError) as exc:
+            return {"error": str(exc)}
+        claim = target.get_claim(int(claim_number))
+        if claim is None:
+            return {"error": f"Claim {claim_number} not found in {target.patent_number}"}
+        try:
+            limitations = claim.atomic_limitations or split_atomic_limitations(
+                claim, target, llm=self.llm)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"Could not split claim {claim_number} into limitations: {exc}"}
+        limitation_texts = [lim.text for lim in limitations]
+
+        wrapper_text = target.file_wrapper_text
+        wrapper_error: Optional[str] = None
+        if not wrapper_text and os.environ.get("USPTO_ODP_API_KEY"):
+            wrapper_text, wrapper_error = self._fetch_file_wrapper_text(target)
+
+        if wrapper_text and self.llm is not None:
+            return self._summarize_from_wrapper(target, claim, limitation_texts, wrapper_text)
+
+        # Degraded path: no prosecution-history context (or no LLM to read it).
+        if wrapper_text:  # have the history but no LLM to read it
+            note = ("No LLM configured to read the prosecution history; "
+                    "returning ALL limitations from a claim split.")
+        elif wrapper_error:
+            note = ("File-wrapper retrieval failed; returning ALL limitations "
+                    f"from a claim split. Error: {wrapper_error}")
+        elif os.environ.get("USPTO_ODP_API_KEY"):
+            note = ("The file wrapper contained no readable documents; "
+                    "returning ALL limitations from a claim split.")
+        else:
+            note = ("File-wrapper (prosecution-history) context is unavailable "
+                    "without USPTO_ODP_API_KEY; returning ALL limitations from a "
+                    "claim split instead of the allowance-critical ones.")
+        lines = [f"## Claim limitations — {target.patent_number}, claim {claim_number}",
+                 "", f"_{note}_", ""]
+        lines += [f"{i}. {text}" for i, text in enumerate(limitation_texts, start=1)]
+        return {
+            "patent": str(target.patent_number),
+            "claim_number": int(claim_number),
+            "mode": "claim_split_only",
+            "key_limitations": limitation_texts,
+            "note": note,
+            "markdown": "\n".join(lines),
+        }
+
+    def _fetch_file_wrapper_text(self, target: Patent) -> tuple[Optional[str], Optional[str]]:
+        """Pull prosecution-history text via the ODP connector, best-effort."""
+        try:
+            from patentkit.connectors.inference.file_wrapper import FileWrapperClient  # noqa: PLC0415
+        except ImportError as exc:
+            return None, f"file-wrapper connector unavailable: {exc}"
+        try:
+            client = FileWrapperClient()
+            app_number = target.application_number or client.app_number_for_patent(
+                target.patent_number)
+            if not app_number:
+                return None, (f"could not resolve an application number for "
+                              f"{target.patent_number}")
+            return client.get_file_wrapper_text(app_number) or None, None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("file-wrapper fetch failed for %s", target.patent_number,
+                           exc_info=True)
+            return None, str(exc)
+
+    def _summarize_from_wrapper(self, target: Patent, claim: Any,
+                                limitation_texts: list[str], wrapper_text: str) -> dict:
+        """LLM pass over the prosecution history: which limitations mattered."""
+        prompt = _KEY_LIMITATIONS_PROMPT.format(
+            patent=target.patent_number,
+            claim_number=claim.number,
+            claim=claim.text,
+            limitations="\n".join(f"- {t}" for t in limitation_texts),
+            wrapper=wrapper_text[:_WRAPPER_CHAR_CAP],
+        )
+        try:
+            data = self.llm.complete_json(prompt, max_tokens=4096)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"File-wrapper summarization failed: {exc}"}
+        if not isinstance(data, dict):
+            data = {}
+        details: list[dict] = []
+        for item in data.get("key_limitations") or []:
+            if not isinstance(item, dict) or not str(item.get("limitation", "")).strip():
+                continue
+            raw = " ".join(str(item["limitation"]).split())
+            # keep the result honest: snap to an actual limitation when possible
+            matched = next(
+                (t for t in limitation_texts
+                 if raw.lower() in " ".join(t.split()).lower()
+                 or " ".join(t.split()).lower() in raw.lower()),
+                raw,
+            )
+            details.append({"limitation": matched, "why": str(item.get("why", "")).strip()})
+        summary = str(data.get("summary", "")).strip()
+        if not details:
+            return {"error": "The LLM identified no key limitations from the file "
+                             "wrapper; inspect the prosecution history manually or "
+                             "fall back to the full claim split."}
+        lines = [f"## Key limitations — {target.patent_number}, claim {claim.number}", "",
+                 "_Source: USPTO file wrapper (prosecution history) — limitations "
+                 "added or argued for allowance._", ""]
+        lines += [f"- **{d['limitation']}**" + (f" — {d['why']}" if d["why"] else "")
+                  for d in details]
+        if summary:
+            lines += ["", summary]
+        return {
+            "patent": str(target.patent_number),
+            "claim_number": int(claim.number),
+            "mode": "file_wrapper",
+            "key_limitations": [d["limitation"] for d in details],
+            "details": details,
+            "summary": summary or None,
+            "markdown": "\n".join(lines),
+        }
 
     def cluster_patents(self, numbers: Optional[list[str]] = None,
                         query: Optional[str] = None) -> dict:
@@ -542,26 +969,32 @@ def _spec(name: str, description: str, properties: dict, required: list[str] | N
 TOOL_SPECS: list[dict] = [
     _spec(
         "search_patents",
-        "Search the indexed patent corpus (BM25 keyword search with metadata "
-        "filters). Returns ranked patents with highlighted passages. Supports "
-        "the full query parameter set: keywords, required/excluded keywords, "
-        "free text, minimum-match, field selection, CPC art classes, "
-        "inventors, assignees, date cutoffs, countries, and exclusions.",
+        "Call this for a quick one-off lookup over the indexed patent corpus "
+        "(BM25 keyword search with metadata filters) — e.g. to check what is "
+        "indexed or sanity-check a query idea. For a real prior-art / FTO / "
+        "infringement investigation, prefer guided_search_start, which runs "
+        "an agentic multi-query search. Supports the full query parameter "
+        "set: keywords, required/excluded keywords, free text, minimum-match, "
+        "field selection, CPC art classes, inventors, assignees, date "
+        "cutoffs, countries, and exclusions; returns ranked patents with "
+        "highlighted passages.",
         dict(_SEARCH_QUERY_PROPERTIES),
     ),
     _spec(
         "get_patent",
-        "Fetch one patent record (title, abstract, claims, dates, citations, "
-        "classifications) by number, e.g. 'US10123456B2'. Checks the local "
-        "index first, then Google Patents when that connector is available.",
+        "Call this when you need one patent's full record — title, abstract, "
+        "claims, dates, citations, classifications — e.g. before charting it "
+        "or discussing its claims. Checks the local index first, then Google "
+        "Patents when that connector is available.",
         {"number": {"type": "string", "description": "Patent number, e.g. 'US10123456B2'."}},
         ["number"],
     ),
     _spec(
         "index_patents",
-        "Add patents to the searchable index, by patent numbers (fetched via "
-        "the Google Patents connector) and/or a JSONL file of canonical "
-        "Patent records (one JSON object per line).",
+        "Call this BEFORE searching when the corpus is empty or missing "
+        "documents: adds patents to the searchable index by patent numbers "
+        "(fetched via the Google Patents connector) and/or a JSONL file of "
+        "canonical Patent records (one JSON object per line).",
         {
             "numbers": _arr("Patent numbers to fetch and index."),
             "jsonl_path": {"type": "string", "description": "Path to a .jsonl file of Patent records."},
@@ -569,31 +1002,39 @@ TOOL_SPECS: list[dict] = [
     ),
     _spec(
         "guided_search_start",
-        "Start a guided agentic patent search session ('invalidity' needs "
-        "patent_number; 'fto' needs product_description; 'infringement' needs "
-        "patent_number). Returns a session_id, a preview of the starting "
-        "query angles (the executing LLM agent generates and refines its own "
-        "queries at run time), and an up-front time estimate. Present the "
-        "preview (and estimate) to the user and collect feedback before "
-        "executing. Invalidity searches exclude examiner-cited art and "
-        "family members by default — enforced at the tool layer.",
+        "Call this to begin any serious patent search ('invalidity' needs "
+        "patent_number; 'fto' needs product_description; 'infringement' "
+        "needs patent_number). Returns a session_id, a preview of the "
+        "starting query angles (the executing LLM agent generates and "
+        "refines its own queries at run time), and an up-front time "
+        "estimate. Present the preview (and estimate) to the user and "
+        "collect feedback before calling guided_search_execute. Pass "
+        "key_limitations (e.g. from summarize_key_limitations) to focus the "
+        "agent on the allowance-critical limitations. Invalidity searches "
+        "exclude examiner-cited art and family members by default — enforced "
+        "at the tool layer.",
         {
             "search_type": {"type": "string", "enum": ["invalidity", "fto", "infringement"],
                             "description": "Which search workflow to run."},
             "patent_number": {"type": "string", "description": "Target patent number."},
             "product_description": {"type": "string", "description": "Target product (FTO)."},
             "claims": _arr("Claim numbers in focus (default: independent claims).", "integer"),
+            "key_limitations": _arr(
+                "Key claim limitations to prioritize (e.g. the key_limitations "
+                "from summarize_key_limitations); injected into the agent's "
+                "task context on first execution."),
         },
         ["search_type"],
     ),
     _spec(
         "guided_search_feedback",
-        "Apply user feedback to a guided session — on the agent's queries "
-        "and/or its results. Before execution it adjusts the plan preview "
-        "and seeds the agent's initial guidance; after execution it is "
-        "queued and injected as a user message when the SAME agent "
-        "conversation resumes (irrelevant results also become hard "
-        "exclusions enforced at the tool layer). Returns the updated state.",
+        "Call this whenever the user comments on a guided search's queries "
+        "or results (between rounds, or after reviewing the trace). Before "
+        "execution it adjusts the plan preview and seeds the agent's initial "
+        "guidance; after execution it is queued and injected as a user "
+        "message when the SAME agent conversation resumes (irrelevant "
+        "results also become hard exclusions enforced at the tool layer). "
+        "Returns the updated state.",
         {
             "session_id": {"type": "string", "description": "Session id from guided_search_start."},
             "feedback": _FEEDBACK_SCHEMA,
@@ -602,40 +1043,55 @@ TOOL_SPECS: list[dict] = [
     ),
     _spec(
         "guided_search_execute",
-        "Execute (or resume) a guided session's agentic search: one LLM "
+        "Call this to run (or RESUME — same session_id continues the same "
+        "agent conversation) a guided session's agentic search: one LLM "
         "agent iteratively generates queries, runs them as tools, reads the "
         "results, refines, and finishes with ranked candidates — under a "
-        "step/wall-clock budget, with a full saved reasoning trace. Queued "
-        "feedback is injected into the resumed conversation. Returns ranked "
-        "results, what was excluded and why, timing, stop_reason, and a "
-        "trace summary (full trace via get_search_trace).",
-        {"session_id": {"type": "string", "description": "Session id from guided_search_start."}},
+        "step/wall-clock budget, with a full saved reasoning trace. Pass "
+        "small budget_seconds/max_steps for short rounds the user can steer "
+        "between with guided_search_feedback. Returns ranked results, what "
+        "was excluded and why, timing, stop_reason, a trace summary (full "
+        "trace via get_search_trace), and a chat-ready 'progress' markdown "
+        "summary to show the user.",
+        {
+            "session_id": {"type": "string", "description": "Session id from guided_search_start."},
+            "budget_seconds": {"type": "number",
+                               "description": "Wall-clock budget override for THIS round "
+                                              "(default 180s). Small values give the user "
+                                              "interjection points between rounds."},
+            "max_steps": {"type": "integer",
+                          "description": "Agent-round budget override for THIS round "
+                                         "(default 16)."},
+        },
         ["session_id"],
     ),
     _spec(
         "guided_search_status",
-        "Get the state of a guided session: plan preview, iteration, time "
-        "estimate, feedback rounds, the latest ranked results, stop_reason, "
-        "elapsed time, and a trace summary (step count, queries issued, the "
-        "agent's intermediate shortlist).",
+        "Call this to check on a guided session without changing it: plan "
+        "preview, iteration, time estimate, feedback rounds, the latest "
+        "ranked results, stop_reason, elapsed time, and a trace summary "
+        "(step count, queries issued, the agent's intermediate shortlist).",
         {"session_id": {"type": "string", "description": "Session id from guided_search_start."}},
         ["session_id"],
     ),
     _spec(
         "get_search_trace",
-        "Get the full reasoning trace of a guided session's last agentic "
-        "execution: a human-readable markdown trace, every query the agent "
-        "issued, and the shortlist evolution. Show it to the user to collect "
-        "feedback on specific queries and results.",
+        "Call this after guided_search_execute when the user should see HOW "
+        "the agent searched: the 'markdown' field is a chat-ready narrative "
+        "(one section per round — thinking, queries as inline code, result "
+        "counts, shortlist updates, injected feedback, stop reason) you can "
+        "display verbatim; raw queries and shortlist history are included "
+        "for programmatic use. Show it to collect feedback on specific "
+        "queries and results.",
         {"session_id": {"type": "string", "description": "Session id from guided_search_start."}},
         ["session_id"],
     ),
     _spec(
         "estimate_search_time",
-        "Estimate how long a search will take before running it (agentic "
-        "model: expected agent steps x per-step latency, plus a corpus-size "
-        "factor and per-claim charting cost). Returns seconds and a "
-        "human-readable duration.",
+        "Call this before committing to a search when the user asks how long "
+        "it will take (agentic model: expected agent steps x per-step "
+        "latency, plus a corpus-size factor and per-claim charting cost). "
+        "Returns seconds and a human-readable duration.",
         {
             "search_type": {"type": "string", "enum": ["invalidity", "fto", "infringement"],
                             "default": "invalidity"},
@@ -648,19 +1104,78 @@ TOOL_SPECS: list[dict] = [
     ),
     _spec(
         "build_claim_chart",
-        "Build an element-by-element invalidity claim chart mapping one claim "
-        "of the target patent against prior-art references, with a coverage "
-        "summary of which limitations each reference discloses.",
+        "Call this after a search to map one claim element-by-element "
+        "against one or more prior-art references. The result's 'markdown' "
+        "field is a ready-to-display claim-chart table (pass "
+        "limitations_filter to chart only the important limitations); "
+        "structured findings and a coverage summary are included for "
+        "programmatic use, and the chart is cached for "
+        "export_claim_chart_docx. For a single limitation across references "
+        "use chart_limitation instead.",
         {
             "patent_number": {"type": "string", "description": "Target patent number."},
             "claim_number": {"type": "integer", "description": "Claim to chart."},
-            "reference_numbers": _arr("Prior-art reference patent numbers."),
+            "reference_numbers": _arr("Prior-art reference patent numbers (one or more)."),
+            "limitations_filter": _arr(
+                "Optional limitation-text substrings; the markdown chart is "
+                "restricted to the matching limitation rows."),
         },
         ["patent_number", "claim_number", "reference_numbers"],
     ),
     _spec(
+        "chart_limitation",
+        "Call this when the user cares about ONE claim limitation (e.g. the "
+        "allowance-critical one) across several references — say results A, "
+        "B, C of a search. Returns a markdown table with one row per "
+        "reference: disclosure status, reasoning, quotes, and citation. "
+        "Reuses assessments cached by build_claim_chart/chart_limitation, so "
+        "it is cheap to call after a full chart; the merged chart is cached "
+        "for export_claim_chart_docx.",
+        {
+            "limitation": {"type": "string",
+                           "description": "The limitation, verbatim or a distinctive "
+                                          "substring of it."},
+            "patent": {"type": "string", "description": "Target patent number."},
+            "claim_number": {"type": "integer", "description": "Claim the limitation belongs to."},
+            "references": _arr("Reference patent numbers to assess (one or more)."),
+        },
+        ["limitation", "patent", "claim_number", "references"],
+    ),
+    _spec(
+        "export_claim_chart_docx",
+        "Call this when the user wants a claim chart as a Word document: "
+        "writes the MOST RECENT cached chart for (patent, claim_number) — "
+        "from build_claim_chart or chart_limitation — as a color-coded DOCX "
+        "and returns the absolute path. No LLM calls are re-run; if no chart "
+        "is cached you must build one first. Requires the docx extra.",
+        {
+            "patent": {"type": "string", "description": "Target patent number."},
+            "claim_number": {"type": "integer", "description": "Charted claim number."},
+            "out_path": {"type": "string",
+                         "description": "Output .docx path (default: an exports/ folder "
+                                        "under the session dir or cwd)."},
+        },
+        ["patent", "claim_number"],
+    ),
+    _spec(
+        "summarize_key_limitations",
+        "Call this BEFORE an invalidity search to find which limitations of "
+        "a claim were added or argued for allowance (the prosecution-history "
+        "'key limitations' — the prime invalidity targets). Uses the USPTO "
+        "file wrapper when USPTO_ODP_API_KEY is set (or the record is "
+        "already enriched); otherwise degrades to a plain claim split with a "
+        "clear note. Returns display markdown plus key_limitations you can "
+        "pass to guided_search_start and limitations_filter/chart_limitation.",
+        {
+            "patent": {"type": "string", "description": "Target patent number."},
+            "claim_number": {"type": "integer", "description": "Claim to analyze."},
+        },
+        ["patent", "claim_number"],
+    ),
+    _spec(
         "cluster_patents",
-        "Cluster a set of patents into technology topics (requires the viz "
+        "Call this when the user wants a thematic overview of a patent set: "
+        "clusters the patents into technology topics (requires the viz "
         "extra). Provide explicit patent numbers or a keyword query whose "
         "results will be clustered.",
         {
@@ -670,16 +1185,17 @@ TOOL_SPECS: list[dict] = [
     ),
     _spec(
         "run_eval",
-        "Run the search-performance eval harness (precision/recall against "
-        "labeled prior art). Uses the built-in toy dataset unless a dataset "
-        "path is given.",
+        "Call this only to measure search performance (precision/recall "
+        "against labeled prior art), e.g. after changing the index — not "
+        "part of a normal search workflow. Uses the built-in toy dataset "
+        "unless a dataset path is given.",
         {"dataset_path": {"type": "string", "description": "Path to an eval dataset file."}},
     ),
     _spec(
         "notify",
-        "Send a notification through the configured channels (Slack webhook, "
-        "SendGrid/SMTP email) — e.g. to announce a finished long-running "
-        "search.",
+        "Call this to alert the user out-of-band through the configured "
+        "channels (Slack webhook, SendGrid/SMTP email) — e.g. to announce a "
+        "finished long-running search.",
         {
             "subject": {"type": "string", "description": "Short subject/headline."},
             "body": {"type": "string", "description": "Message body."},

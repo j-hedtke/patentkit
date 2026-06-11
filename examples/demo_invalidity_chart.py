@@ -68,17 +68,27 @@ def pick_llm(effort: str):
 
 
 def load_corpus() -> dict[str, Patent]:
-    """Real-patent corpus: eval corpus if built, else a small live scrape."""
-    source = EVAL_CORPUS if EVAL_CORPUS.exists() else None
-    if source is None:
-        source = OUT_DIR / "demo_corpus.jsonl"
-        scrape_neighborhood(source)
-    patents: dict[str, Patent] = {}
-    with source.open() as fh:
-        for line in fh:
-            if line.strip():
-                p = Patent.model_validate_json(line)
-                patents[str(p.patent_number)] = p
+    """Real-patent corpus: eval corpus if it contains the target, else a
+    small live scrape (the eval corpus is rebuilt around whatever queryset
+    the eval currently uses, which need not include this demo's patent)."""
+
+    def read(source: Path) -> dict[str, Patent]:
+        patents: dict[str, Patent] = {}
+        with source.open() as fh:
+            for line in fh:
+                if line.strip():
+                    p = Patent.model_validate_json(line)
+                    patents[str(p.patent_number)] = p
+        return patents
+
+    if EVAL_CORPUS.exists():
+        patents = read(EVAL_CORPUS)
+        if QUERY_PATENT in patents:
+            print(f"corpus: {len(patents)} real patents from {EVAL_CORPUS}")
+            return patents
+    source = OUT_DIR / "demo_corpus.jsonl"
+    scrape_neighborhood(source)
+    patents = read(source)
     print(f"corpus: {len(patents)} real patents from {source}")
     return patents
 

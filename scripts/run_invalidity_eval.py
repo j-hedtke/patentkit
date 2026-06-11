@@ -68,7 +68,12 @@ def main() -> None:
         target = by_number[str(PatentNumber.parse(qs["query_patent"]))]
         agent = InvaliditySearchAgent(keyword_store=store, llm=llm)
         started = time.time()
-        out = agent.search(target, claims=qs.get("claims"), final_k=args.final_k)
+        # exclude_examiner_art=False: IPR-derived ground truth may be art the
+        # examiner cited (e.g. Wong in IPR2020-01018 sits on the face of the
+        # '679 patent) — the product-default exclusion would make such
+        # references unreachable and silently floor recall.
+        out = agent.search(target, claims=qs.get("claims"), final_k=args.final_k,
+                           exclude_examiner_art=False)
         elapsed = time.time() - started
         preds = [r["patent_number"] for r in out.results]
         refs = qs["references"]
@@ -100,6 +105,7 @@ def main() -> None:
     n = len(rows)
     report = {
         "llm": llm_desc,
+        "exclusions": "examiner art NOT excluded (IPR ground truth can be face-of-patent art)",
         "index": args.index,
         "corpus_size": len(by_number),
         "final_k": args.final_k,

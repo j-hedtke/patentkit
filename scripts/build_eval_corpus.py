@@ -25,20 +25,23 @@ from patentkit.connectors.inference.google_patents import GooglePatentsScraper
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("build_eval_corpus")
 
-# IPR-example querysets (from patentkit.evals toy IPR set; refs verified to
-# scrape, predate the target's priority date, and not be examiner-cited).
+# Real IPR queryset: IPR2020-01018, Unified Patents, LLC v. Voice Tech Corp.
+# Final Written Decision 2021-12-13 held claims 1-8 of US10491679B2 obvious
+# over Wong (US20060235700A1) in view of Beauregard (US6438545B1); affirmed,
+# Voice Tech Corp. v. Unified Patents, LLC, No. 22-2163 (Fed. Cir. Aug. 1,
+# 2024) (precedential). Ground truth = the references of the winning ground.
 QUERYSETS = [
     {
-        "query_patent": "US5946647A",
-        "claims": [1, 4, 6],
-        "references": ["US5644735A", "US5859636A"],
-        "metadata": {"proceeding": "IPR2020-00104", "toy": True},
-    },
-    {
-        "query_patent": "US8046721B2",
-        "claims": [1, 8],
-        "references": ["US6209104B1", "US5821933A"],
-        "metadata": {"proceeding": "IPR2020-00103", "toy": True},
+        "query_patent": "US10491679B2",
+        "claims": [1],
+        "references": ["US20060235700A1", "US6438545B1"],
+        "metadata": {
+            "proceeding": "IPR2020-01018",
+            "toy": False,
+            "outcome": "claims 1-8 unpatentable (103) over Wong in view of Beauregard",
+            "fwd_date": "2021-12-13",
+            "affirmed": "Fed. Cir. No. 22-2163 (2024-08-01, precedential)",
+        },
     },
 ]
 

@@ -274,3 +274,38 @@ def test_on_step_callback_failures_do_not_break_the_loop() -> None:
     result = run_tool_loop(llm, system="s", messages=[user_text_message("go")],
                            tools=make_tools(), finish_tool="finish", on_step=bad_callback)
     assert result.stop_reason == "finish_tool"
+
+
+def test_malformed_finish_in_grace_round_gets_one_retry():
+    """A budget breach grants a grace round; if the model fumbles the finish
+    call (error payload), it gets exactly one retry instead of ending the run
+    with zero candidates."""
+    from patentkit.llm.tools import ToolDef, run_tool_loop
+    from tests.fakes import FakeLLM
+
+    payloads = []
+
+    def finish(args):
+        if "candidates" not in args:
+            return {"error": "finish requires a 'candidates' array"}
+        payloads.append(args)
+        return {"ok": True}
+
+    tools = [
+        ToolDef("probe", "probe", {"type": "object", "properties": {}},
+                lambda args: {"hits": 0}),
+        ToolDef("finish", "finish", {"type": "object", "properties": {}}, finish),
+    ]
+    llm = FakeLLM(tool_script=[
+        {"tool_calls": [{"name": "probe", "arguments": {}}]},   # round 1 — burns max_steps=1
+        {"tool_calls": [{"name": "finish", "arguments": {}}]},  # grace round — malformed
+        {"tool_calls": [{"name": "finish", "arguments":          # retry — well-formed
+                         {"candidates": [{"number": "US1"}]}}]},
+    ])
+    from patentkit.llm.tools import user_text_message
+
+    result = run_tool_loop(llm, system="s", messages=[user_text_message("find")],
+                           tools=tools, max_steps=1, budget_seconds=999,
+                           finish_tool="finish")
+    assert payloads == [{"candidates": [{"number": "US1"}]}]
+    assert result.stop_reason == "max_steps"

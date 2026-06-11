@@ -194,6 +194,12 @@ def run_tool_loop(
     stop_reason = "end_turn"
     breach_reason: str | None = None
     rounds = 0
+    grace_rounds = 0
+    finish_errored = False
+    # after a budget breach: one round to comply with the wrap-up message,
+    # plus one retry IF the finish call itself was malformed (an empty
+    # finish would otherwise zero out the entire run's candidates).
+    max_grace_rounds = 2
 
     while True:
         # --- budget checks before each provider call -----------------------
@@ -210,9 +216,12 @@ def run_tool_loop(
                 stop_reason = breach_reason
                 break
         elif (over_steps or over_budget) and breach_reason is not None:
-            # the grace round already ran — hard stop
-            stop_reason = breach_reason
-            break
+            grace_rounds += 1
+            if finish_errored and grace_rounds < max_grace_rounds:
+                finish_errored = False  # consume the single retry
+            else:
+                stop_reason = breach_reason
+                break
 
         # --- one provider round --------------------------------------------
         try:
@@ -240,6 +249,7 @@ def run_tool_loop(
 
         result_blocks: list[dict] = []
         finished = False
+        finish_errored = False
         for call in round_.tool_calls:
             assistant_blocks.append({"type": "tool_call", "id": call.id,
                                      "name": call.name, "arguments": call.arguments})
@@ -259,9 +269,11 @@ def run_tool_loop(
             result_blocks.append({"type": "tool_result", "tool_call_id": call.id,
                                   "name": call.name, "content": content})
             _emit(steps, on_step, "tool_result", content, tool_name=call.name, t0=t0)
-            if finish_tool and call.name == finish_tool and (
-                    not isinstance(payload, dict) or "error" not in payload):
-                finished = True
+            if finish_tool and call.name == finish_tool:
+                if not isinstance(payload, dict) or "error" not in payload:
+                    finished = True
+                else:
+                    finish_errored = True
 
         convo.append({"role": "assistant", "content": assistant_blocks})
         convo.append({"role": "user", "content": result_blocks})

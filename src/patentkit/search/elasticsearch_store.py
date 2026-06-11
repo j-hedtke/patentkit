@@ -449,7 +449,9 @@ class ElasticsearchStore:
         body = {
             "query": build_es_query(query),
             "size": query.limit,
-            "highlight": {"fields": highlight_fields},
+            # max_analyzed_offset: real specifications can exceed the index's
+            # 1M-char highlight analysis limit; truncate instead of erroring.
+            "highlight": {"fields": highlight_fields, "max_analyzed_offset": 999_999},
         }
         response = self.client.search(index=self.index_name, body=body)
         return [self._hit_to_result(hit, "elasticsearch bm25") for hit in response["hits"]["hits"]]
