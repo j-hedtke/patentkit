@@ -17,12 +17,22 @@ Environment configuration (in addition to the variables documented in
 - ``PATENTKIT_MCP_TOKEN``  if set, every HTTP request must carry
   ``Authorization: Bearer <token>`` (or ``?token=<token>``) or it is rejected
   with 401. Always set this before exposing the server through a tunnel.
-- ``PATENTKIT_AUTH_MODE``  ``token`` (default — the static bearer path above) or
-  ``oauth-google`` (Google-delegated, email-allowlisted OAuth; see
-  :mod:`patentkit.integrations.mcp_oauth` for its environment variables). In
-  ``oauth-google`` mode the app mounts the OAuth metadata/authorize/token/
-  register/revoke routes, a ``/auth/google/callback`` route, protected-resource
-  metadata, and the SDK's bearer-auth middleware gating ``/mcp``.
+- ``PATENTKIT_AUTH_MODE``  one of three modes (code-level default ``token``):
+
+  - ``token``         the static bearer path above (``PATENTKIT_MCP_TOKEN``).
+  - ``oauth-google``  Google-delegated, email-allowlisted OAuth — patentkit is
+    the OAuth AS, Google authenticates the human. Mounts the OAuth metadata/
+    authorize/token/register/revoke routes, a ``/auth/google/callback`` route,
+    protected-resource metadata, and the SDK bearer-auth middleware gating
+    ``/mcp``.
+  - ``oauth-secret``  self-contained OAuth with NO external identity provider —
+    patentkit is the OAuth AS and the human authenticates by typing a shared
+    secret (``PATENTKIT_ACCESS_SECRET``) once on a local ``/auth/approve`` page.
+    Same OAuth surface as ``oauth-google`` but with the approve GET+POST routes
+    mounted instead of the Google callback, and zero outbound network calls.
+
+  See :mod:`patentkit.integrations.mcp_oauth` for each mode's environment
+  variables.
 
 Requires the ``mcp-http`` extra: ``pip install 'patentkit[mcp-http]'``.
 """
@@ -44,6 +54,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_PORT = 8765
 MCP_PATH = "/mcp"
 GOOGLE_CALLBACK_PATH = "/auth/google/callback"
+APPROVE_PATH = "/auth/approve"
 
 _INSTALL_HINT = (
     "patentkit's MCP streamable-http transport requires the 'mcp-http' extra "
@@ -156,68 +167,10 @@ def build_http_app(
     return app
 
 
-def build_oauth_http_app(
-    toolset: Any = None,
-    *,
-    config: Any = None,
-    provider: Any = None,
-    json_response: bool = False,
-    stateless: bool = False,
-) -> Any:
-    """Build the ASGI app for ``oauth-google`` mode (patentkit as OAuth AS).
-
-    Mounts, alongside the StreamableHTTP ``/mcp`` route:
-
-    - OAuth AS metadata + ``/authorize`` + ``/token`` + ``/register`` + ``/revoke``
-      (:func:`mcp.server.auth.routes.create_auth_routes`),
-    - ``/auth/google/callback`` (the upstream-IdP return leg),
-    - RFC 9728 protected-resource metadata, and
-    - the SDK bearer-auth middleware (``AuthenticationMiddleware`` +
-      ``BearerAuthBackend``) plus ``RequireAuthMiddleware`` gating ``/mcp`` on a
-      valid Google-derived access JWT.
-
-    ``config``/``provider`` are injectable for tests; otherwise built from env.
-    """
-    try:
-        from mcp.server.auth.middleware.auth_context import AuthContextMiddleware  # noqa: PLC0415
-        from mcp.server.auth.middleware.bearer_auth import (  # noqa: PLC0415
-            BearerAuthBackend,
-            RequireAuthMiddleware,
-        )
-        from mcp.server.auth.routes import (  # noqa: PLC0415
-            build_resource_metadata_url,
-            create_auth_routes,
-            create_protected_resource_routes,
-        )
-        from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions  # noqa: PLC0415
-        from pydantic import AnyHttpUrl  # noqa: PLC0415
-        from starlette.applications import Starlette  # noqa: PLC0415
-        from starlette.middleware import Middleware  # noqa: PLC0415
-        from starlette.middleware.authentication import AuthenticationMiddleware  # noqa: PLC0415
-        from starlette.responses import HTMLResponse, RedirectResponse  # noqa: PLC0415
-        from starlette.routing import Route  # noqa: PLC0415
-    except ImportError as exc:
-        raise ImportError(_INSTALL_HINT) from exc
-
-    from patentkit.integrations.mcp_oauth import (  # noqa: PLC0415
-        PatentkitGoogleOAuthProvider,
-        PatentkitTokenVerifier,
-        load_oauth_config,
-    )
-
-    if config is None:
-        config = load_oauth_config()
-    if provider is None:
-        provider = PatentkitGoogleOAuthProvider(config)
-    verifier = PatentkitTokenVerifier(provider)
-
-    issuer_url = AnyHttpUrl(config.issuer)
-    resource_url = AnyHttpUrl(config.resource_url)
-    scopes = ["patentkit"]
-
-    endpoint, lifespan = _build_streamable_manager(
-        toolset, json_response=json_response, stateless=stateless
-    )
+def _google_auth_routes(provider: Any) -> list[Any]:
+    """The Google-mode user-authentication leg: a single GET callback route."""
+    from starlette.responses import HTMLResponse, RedirectResponse  # noqa: PLC0415
+    from starlette.routing import Route  # noqa: PLC0415
 
     async def google_callback(request: Any) -> Any:
         code = request.query_params.get("code")
@@ -237,6 +190,142 @@ def build_oauth_http_app(
             status_code=400,
         )
 
+    return [Route(GOOGLE_CALLBACK_PATH, endpoint=google_callback, methods=["GET"])]
+
+
+def _approve_page_html(state: str, *, error: str | None = None) -> str:
+    """Minimal self-contained approve page — no external assets/CDN, inline CSS."""
+    from html import escape  # noqa: PLC0415
+
+    state_attr = escape(state, quote=True)
+    error_html = (
+        f'<p class="err" role="alert">{escape(error)}</p>' if error else ""
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize patentkit</title>
+<style>
+  body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+          background: #f5f5f7; margin: 0; padding: 2rem;
+          display: flex; justify-content: center; }}
+  .card {{ background: #fff; max-width: 26rem; width: 100%; padding: 2rem;
+           border-radius: 12px; box-shadow: 0 1px 4px rgba(0,0,0,.12); }}
+  h1 {{ font-size: 1.25rem; margin: 0 0 .5rem; }}
+  p {{ color: #444; line-height: 1.5; }}
+  label {{ display: block; font-weight: 600; margin: 1rem 0 .35rem; }}
+  input[type=password] {{ width: 100%; box-sizing: border-box; padding: .6rem;
+           font-size: 1rem; border: 1px solid #ccc; border-radius: 8px; }}
+  button {{ margin-top: 1.25rem; width: 100%; padding: .7rem; font-size: 1rem;
+            font-weight: 600; color: #fff; background: #1a73e8; border: 0;
+            border-radius: 8px; cursor: pointer; }}
+  .err {{ color: #b00020; font-weight: 600; }}
+</style>
+</head>
+<body>
+  <main class="card">
+    <h1>Authorize this patentkit MCP server</h1>
+    <p>Enter the access code to connect this patentkit server to claude.ai.</p>
+    {error_html}
+    <form method="post" action="{APPROVE_PATH}">
+      <input type="hidden" name="state" value="{state_attr}">
+      <label for="secret">Access code</label>
+      <input type="password" id="secret" name="secret" autocomplete="off"
+             autofocus required>
+      <button type="submit">Authorize</button>
+    </form>
+  </main>
+</body>
+</html>"""
+
+
+def _secret_auth_routes(provider: Any) -> list[Any]:
+    """The secret-mode user-authentication leg: GET + POST ``/auth/approve``."""
+    from starlette.responses import HTMLResponse, RedirectResponse  # noqa: PLC0415
+    from starlette.routing import Route  # noqa: PLC0415
+
+    async def approve_get(request: Any) -> Any:
+        state = request.query_params.get("state")
+        if not provider.peek_pending(state):
+            return HTMLResponse(
+                "<h1>Request expired</h1><p>This authorization request is "
+                "unknown or has expired. Please try connecting again.</p>",
+                status_code=400,
+            )
+        return HTMLResponse(_approve_page_html(state), headers={"Cache-Control": "no-store"})
+
+    async def approve_post(request: Any) -> Any:
+        form = await request.form()
+        state = form.get("state")
+        secret = form.get("secret")
+        redirect_url, error = provider.complete_secret_approval(state, secret)
+        if redirect_url:
+            return RedirectResponse(url=redirect_url, status_code=303, headers={"Cache-Control": "no-store"})
+        if error == "access_denied":
+            # Wrong secret: re-render the form with an error, issue nothing.
+            return HTMLResponse(
+                _approve_page_html(state or "", error="Incorrect access code."),
+                status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        # Unknown/expired state.
+        return HTMLResponse(
+            "<h1>Request expired</h1><p>This authorization request is unknown "
+            "or has expired. Please try connecting again.</p>",
+            status_code=400,
+        )
+
+    return [
+        Route(APPROVE_PATH, endpoint=approve_get, methods=["GET"]),
+        Route(APPROVE_PATH, endpoint=approve_post, methods=["POST"]),
+    ]
+
+
+def _assemble_oauth_app(
+    *,
+    config: Any,
+    provider: Any,
+    auth_route_builder: Any,
+    toolset: Any,
+    json_response: bool,
+    stateless: bool,
+) -> Any:
+    """Build the OAuth AS Starlette app shared by both OAuth modes.
+
+    Everything is identical across modes except ``auth_route_builder(provider)``,
+    which supplies the mode-specific user-authentication route(s) (Google
+    callback vs. the local approve GET+POST).
+    """
+    from mcp.server.auth.middleware.auth_context import AuthContextMiddleware  # noqa: PLC0415
+    from mcp.server.auth.middleware.bearer_auth import (  # noqa: PLC0415
+        BearerAuthBackend,
+        RequireAuthMiddleware,
+    )
+    from mcp.server.auth.routes import (  # noqa: PLC0415
+        build_resource_metadata_url,
+        create_auth_routes,
+        create_protected_resource_routes,
+    )
+    from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions  # noqa: PLC0415
+    from pydantic import AnyHttpUrl  # noqa: PLC0415
+    from starlette.applications import Starlette  # noqa: PLC0415
+    from starlette.middleware import Middleware  # noqa: PLC0415
+    from starlette.middleware.authentication import AuthenticationMiddleware  # noqa: PLC0415
+    from starlette.routing import Route  # noqa: PLC0415
+
+    from patentkit.integrations.mcp_oauth import PatentkitTokenVerifier  # noqa: PLC0415
+
+    verifier = PatentkitTokenVerifier(provider)
+    issuer_url = AnyHttpUrl(config.issuer)
+    resource_url = AnyHttpUrl(config.resource_url)
+    scopes = ["patentkit"]
+
+    endpoint, lifespan = _build_streamable_manager(
+        toolset, json_response=json_response, stateless=stateless
+    )
+
     resource_metadata_url = build_resource_metadata_url(resource_url)
 
     routes = create_auth_routes(
@@ -247,7 +336,7 @@ def build_oauth_http_app(
         ),
         revocation_options=RevocationOptions(enabled=True),
     )
-    routes.append(Route(GOOGLE_CALLBACK_PATH, endpoint=google_callback, methods=["GET"]))
+    routes.extend(auth_route_builder(provider))
     routes.extend(
         create_protected_resource_routes(
             resource_url=resource_url,
@@ -263,8 +352,65 @@ def build_oauth_http_app(
         Middleware(AuthenticationMiddleware, backend=BearerAuthBackend(verifier)),
         Middleware(AuthContextMiddleware),
     ]
-
     return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
+
+
+def build_oauth_http_app(
+    toolset: Any = None,
+    *,
+    config: Any = None,
+    provider: Any = None,
+    json_response: bool = False,
+    stateless: bool = False,
+) -> Any:
+    """Build the ASGI app for an OAuth mode (patentkit as the OAuth AS).
+
+    Mounts, alongside the StreamableHTTP ``/mcp`` route:
+
+    - OAuth AS metadata + ``/authorize`` + ``/token`` + ``/register`` + ``/revoke``
+      (:func:`mcp.server.auth.routes.create_auth_routes`),
+    - the mode's user-authentication leg — ``/auth/google/callback`` for
+      ``oauth-google`` or the ``/auth/approve`` GET+POST page for ``oauth-secret``,
+    - RFC 9728 protected-resource metadata, and
+    - the SDK bearer-auth middleware (``AuthenticationMiddleware`` +
+      ``BearerAuthBackend``) plus ``RequireAuthMiddleware`` gating ``/mcp`` on a
+      valid patentkit-issued access JWT.
+
+    The mode is taken from ``config.mode`` (built from env when ``config`` is
+    ``None``). ``config``/``provider`` are injectable for tests.
+    """
+    try:
+        import mcp.server.auth.routes  # noqa: F401, PLC0415
+        import starlette.applications  # noqa: F401, PLC0415
+    except ImportError as exc:
+        raise ImportError(_INSTALL_HINT) from exc
+
+    from patentkit.integrations.mcp_oauth import (  # noqa: PLC0415
+        PatentkitGoogleOAuthProvider,
+        PatentkitSecretOAuthProvider,
+        load_oauth_config,
+    )
+
+    if config is None:
+        config = load_oauth_config()
+
+    if config.mode == "oauth-secret":
+        if provider is None:
+            provider = PatentkitSecretOAuthProvider(config)
+        auth_route_builder = _secret_auth_routes
+    else:
+        if provider is None:
+            provider = PatentkitGoogleOAuthProvider(config)
+        auth_route_builder = _google_auth_routes
+
+    return _assemble_oauth_app(
+        config=config,
+        provider=provider,
+        auth_route_builder=auth_route_builder,
+        toolset=toolset,
+        json_response=json_response,
+        stateless=stateless,
+    )
 
 
 def serve_http(*, host: str | None = None, port: int | None = None) -> None:
@@ -284,6 +430,15 @@ def serve_http(*, host: str | None = None, port: int | None = None) -> None:
         logger.info(
             "patentkit-mcp: streamable-http transport listening on http://%s:%d%s "
             "(auth: oauth-google — Google sign-in, email allowlist)",
+            host,
+            port,
+            MCP_PATH,
+        )
+    elif auth_mode == "oauth-secret":
+        app = build_oauth_http_app()
+        logger.info(
+            "patentkit-mcp: streamable-http transport listening on http://%s:%d%s "
+            "(auth: oauth-secret — self-contained, shared access code, no external IdP)",
             host,
             port,
             MCP_PATH,

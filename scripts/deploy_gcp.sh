@@ -58,13 +58,19 @@ SIGNING_SECRET="patentkit-oauth-signing"               # HS256 key for issued JW
 GOOGLE_SECRET="patentkit-google-oauth-secret"          # Google OAuth client secret
 CORPUS_LOCAL="${REPO_ROOT}/data/eval_corpus/corpus.jsonl"
 
-# AUTH_MODE: "token" (static bearer in the URL, default) or "oauth-google"
-# (Google sign-in gated by an email allowlist; tokens ride the Authorization
-# header). oauth-google additionally needs, via env or flags:
-#   GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET  (one-time, made in the
-#     Google Cloud console — gcloud cannot create OAuth web clients), and
-#   ALLOWED_EMAILS  (comma-separated Google accounts allowed to sign in).
-AUTH_MODE="${AUTH_MODE:-token}"
+# AUTH_MODE (default "oauth-secret"):
+#   oauth-secret  — claude.ai authenticates via OAuth; you approve once by
+#                   typing a generated access code on a local page, then a
+#                   short-lived token rides the Authorization header. No
+#                   external identity provider, no extra setup. RECOMMENDED.
+#   oauth-google  — Google sign-in gated by an email allowlist. Per-person
+#                   identity, but each deployer must create a Google OAuth web
+#                   client in the console (gcloud can't) and set, via env/flags:
+#                   GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET,
+#                   ALLOWED_EMAILS. Redirect URI: <service-url>/auth/google/callback
+#   token         — static bearer secret carried in the connector URL. Simplest,
+#                   least hygienic (token in logs/history); fine for quick demos.
+AUTH_MODE="${AUTH_MODE:-oauth-secret}"
 
 echo "==> Deploying patentkit MCP server"
 echo "    project: ${PROJECT}   region: ${REGION}"
@@ -142,6 +148,34 @@ else
   echo "    (rotate with: gcloud secrets versions add ${KEY_SECRET} --data-file=- )"
 fi
 
+# A generated secret in $TOKEN_SECRET serves as the static bearer (token mode)
+# OR the access code typed on the approve page (oauth-secret mode). Created
+# once, reused on reruns; surfaced as MCP_TOKEN for the summary.
+ensure_token_secret() {
+  if ! gcloud secrets describe "$TOKEN_SECRET" --project "$PROJECT" >/dev/null 2>&1; then
+    MCP_TOKEN="$(openssl rand -hex 32)"
+    printf '%s' "$MCP_TOKEN" | gcloud secrets create "$TOKEN_SECRET" \
+      --project "$PROJECT" --replication-policy automatic --data-file=-
+    echo "    generated and stored the access secret (${TOKEN_SECRET})."
+  else
+    MCP_TOKEN="$(gcloud secrets versions access latest \
+      --secret "$TOKEN_SECRET" --project "$PROJECT")"
+    echo "    secret ${TOKEN_SECRET} already exists — reusing it."
+  fi
+}
+
+# HS256 key patentkit uses to sign the JWTs it issues; generate once, reuse so
+# live sessions survive redeploys.
+ensure_signing_secret() {
+  if ! gcloud secrets describe "$SIGNING_SECRET" --project "$PROJECT" >/dev/null 2>&1; then
+    openssl rand -hex 32 | gcloud secrets create "$SIGNING_SECRET" \
+      --project "$PROJECT" --replication-policy automatic --data-file=-
+    echo "    generated token-signing key (${SIGNING_SECRET})."
+  else
+    echo "    signing key ${SIGNING_SECRET} already exists — reusing it."
+  fi
+}
+
 if [[ "$AUTH_MODE" == "oauth-google" ]]; then
   if [[ -z "${GOOGLE_OAUTH_CLIENT_ID:-}" || -z "${GOOGLE_OAUTH_CLIENT_SECRET:-}" || -z "${ALLOWED_EMAILS:-}" ]]; then
     echo "ERROR: oauth-google mode needs GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET," >&2
@@ -149,7 +183,6 @@ if [[ "$AUTH_MODE" == "oauth-google" ]]; then
     echo "       its authorized redirect URI is <service-url>/auth/google/callback)." >&2
     exit 1
   fi
-  # Google client secret in Secret Manager (create or rotate to keep deploys current).
   if gcloud secrets describe "$GOOGLE_SECRET" --project "$PROJECT" >/dev/null 2>&1; then
     printf '%s' "$GOOGLE_OAUTH_CLIENT_SECRET" | gcloud secrets versions add "$GOOGLE_SECRET" \
       --project "$PROJECT" --data-file=-
@@ -158,24 +191,12 @@ if [[ "$AUTH_MODE" == "oauth-google" ]]; then
       --project "$PROJECT" --replication-policy automatic --data-file=-
   fi
   echo "    stored Google OAuth client secret (${GOOGLE_SECRET})."
-  # HS256 signing key for the JWTs patentkit issues (generate once, then reuse
-  # so existing sessions survive redeploys).
-  if ! gcloud secrets describe "$SIGNING_SECRET" --project "$PROJECT" >/dev/null 2>&1; then
-    openssl rand -hex 32 | gcloud secrets create "$SIGNING_SECRET" \
-      --project "$PROJECT" --replication-policy automatic --data-file=-
-    echo "    generated token-signing key (${SIGNING_SECRET})."
-  else
-    echo "    signing key ${SIGNING_SECRET} already exists — reusing it."
-  fi
-elif ! gcloud secrets describe "$TOKEN_SECRET" --project "$PROJECT" >/dev/null 2>&1; then
-  MCP_TOKEN="$(openssl rand -hex 32)"
-  printf '%s' "$MCP_TOKEN" | gcloud secrets create "$TOKEN_SECRET" \
-    --project "$PROJECT" --replication-policy automatic --data-file=-
-  echo "    generated and stored a fresh access token (${TOKEN_SECRET})."
+  ensure_signing_secret
+elif [[ "$AUTH_MODE" == "oauth-secret" ]]; then
+  ensure_token_secret      # the access code typed on the approve page
+  ensure_signing_secret
 else
-  MCP_TOKEN="$(gcloud secrets versions access latest \
-    --secret "$TOKEN_SECRET" --project "$PROJECT")"
-  echo "    secret ${TOKEN_SECRET} already exists — reusing it."
+  ensure_token_secret      # token mode: static bearer in the URL
 fi
 
 # ------------------------------------------------------------- 6. permissions
@@ -185,11 +206,11 @@ fi
 echo "==> [6/8] Granting the Cloud Run service account access..."
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format 'value(projectNumber)')"
 RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-if [[ "$AUTH_MODE" == "oauth-google" ]]; then
-  GRANT_SECRETS=("$KEY_SECRET" "$GOOGLE_SECRET" "$SIGNING_SECRET")
-else
-  GRANT_SECRETS=("$KEY_SECRET" "$TOKEN_SECRET")
-fi
+case "$AUTH_MODE" in
+  oauth-google) GRANT_SECRETS=("$KEY_SECRET" "$GOOGLE_SECRET" "$SIGNING_SECRET") ;;
+  oauth-secret) GRANT_SECRETS=("$KEY_SECRET" "$TOKEN_SECRET" "$SIGNING_SECRET") ;;
+  *)            GRANT_SECRETS=("$KEY_SECRET" "$TOKEN_SECRET") ;;
+esac
 for secret in "${GRANT_SECRETS[@]}"; do
   gcloud secrets add-iam-policy-binding "$secret" --project "$PROJECT" \
     --member "serviceAccount:${RUNTIME_SA}" \
@@ -220,18 +241,25 @@ PUBLIC_URL="$(gcloud run services describe "$SERVICE" \
   --region "$REGION" --project "$PROJECT" --format 'value(status.url)' 2>/dev/null || true)"
 
 COMMON_ENV="PATENTKIT_PROVIDER=anthropic,PATENTKIT_INDEX_JSONL=/data/corpus.jsonl,PATENTKIT_SESSION_DIR=/data/sessions"
-if [[ "$AUTH_MODE" == "oauth-google" ]]; then
-  if [[ -z "$PUBLIC_URL" ]]; then
-    echo "ERROR: oauth-google needs the service URL up front, but ${SERVICE} does not exist yet." >&2
-    echo "       Deploy once in token mode (AUTH_MODE=token) to mint the URL, then re-run in oauth-google." >&2
-    exit 1
-  fi
-  ENV_VARS="${COMMON_ENV},PATENTKIT_AUTH_MODE=oauth-google,PATENTKIT_PUBLIC_URL=${PUBLIC_URL},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID},PATENTKIT_ALLOWED_EMAILS=${ALLOWED_EMAILS},PATENTKIT_OAUTH_DIR=/data/oauth"
-  SECRETS="ANTHROPIC_API_KEY=${KEY_SECRET}:latest,GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_SECRET}:latest,PATENTKIT_OAUTH_SIGNING_SECRET=${SIGNING_SECRET}:latest"
-else
-  ENV_VARS="$COMMON_ENV"
-  SECRETS="ANTHROPIC_API_KEY=${KEY_SECRET}:latest,PATENTKIT_MCP_TOKEN=${TOKEN_SECRET}:latest"
+if [[ "$AUTH_MODE" == oauth-* && -z "$PUBLIC_URL" ]]; then
+  echo "ERROR: ${AUTH_MODE} needs the service URL up front, but ${SERVICE} does not exist yet." >&2
+  echo "       Deploy once in token mode (AUTH_MODE=token) to mint the URL, then re-run." >&2
+  exit 1
 fi
+case "$AUTH_MODE" in
+  oauth-google)
+    ENV_VARS="${COMMON_ENV},PATENTKIT_AUTH_MODE=oauth-google,PATENTKIT_PUBLIC_URL=${PUBLIC_URL},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID},PATENTKIT_ALLOWED_EMAILS=${ALLOWED_EMAILS},PATENTKIT_OAUTH_DIR=/data/oauth"
+    SECRETS="ANTHROPIC_API_KEY=${KEY_SECRET}:latest,GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_SECRET}:latest,PATENTKIT_OAUTH_SIGNING_SECRET=${SIGNING_SECRET}:latest"
+    ;;
+  oauth-secret)
+    ENV_VARS="${COMMON_ENV},PATENTKIT_AUTH_MODE=oauth-secret,PATENTKIT_PUBLIC_URL=${PUBLIC_URL},PATENTKIT_OAUTH_DIR=/data/oauth"
+    SECRETS="ANTHROPIC_API_KEY=${KEY_SECRET}:latest,PATENTKIT_ACCESS_SECRET=${TOKEN_SECRET}:latest,PATENTKIT_OAUTH_SIGNING_SECRET=${SIGNING_SECRET}:latest"
+    ;;
+  *)
+    ENV_VARS="$COMMON_ENV"
+    SECRETS="ANTHROPIC_API_KEY=${KEY_SECRET}:latest,PATENTKIT_MCP_TOKEN=${TOKEN_SECRET}:latest"
+    ;;
+esac
 
 gcloud run deploy "$SERVICE" \
   --image "$IMAGE" \
@@ -260,7 +288,24 @@ echo
 echo "Service URL:    ${SERVICE_URL}"
 echo "MCP endpoint:   ${SERVICE_URL}/mcp"
 echo
-if [[ "$AUTH_MODE" == "oauth-google" ]]; then
+if [[ "$AUTH_MODE" == "oauth-secret" ]]; then
+  cat <<EOF
+Auth: OAuth (self-contained — no external identity provider).
+
+Access code (you'll type this once on the approve page, then never again):
+  ${MCP_TOKEN}
+
+claude.ai connector (Settings -> Connectors -> Add custom connector):
+  Name: patentkit
+  Remote MCP server URL: ${SERVICE_URL}/mcp
+  Leave OAuth Client ID / Secret BLANK — claude.ai discovers the auth server,
+  registers itself, then sends you to the approve page to enter the access
+  code above. After that, a short-lived token rides the Authorization header.
+
+Verify discovery (expects JSON metadata with authorize/token endpoints):
+  curl -sS "${SERVICE_URL}/.well-known/oauth-authorization-server"
+EOF
+elif [[ "$AUTH_MODE" == "oauth-google" ]]; then
   cat <<EOF
 Auth: Google sign-in (allowlist: ${ALLOWED_EMAILS}).
 

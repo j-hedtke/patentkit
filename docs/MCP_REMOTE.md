@@ -68,19 +68,37 @@ query-param form.
 The cloudflared recipe above is the **quick local demo** — the URL dies with
 your laptop. For a server that's always reachable and keeps its corpus,
 sessions, and graph stores across restarts, deploy to Google Cloud Run with a
-GCS bucket mounted at `/data` and secrets (your Anthropic key + an
-auto-generated access token) in Secret Manager. One scale-to-zero instance:
-roughly $0 while idle; LLM calls bill to your key.
+GCS bucket mounted at `/data` and secrets in Secret Manager. One scale-to-zero
+instance: roughly $0 while idle; LLM calls bill to your key.
 
 ```bash
 git clone https://github.com/j-hedtke/patentkit && cd patentkit
 PROJECT=<your-gcp-project> ./scripts/deploy_gcp.sh
-# then paste the printed https://...run.app/mcp?token=... URL into
+# paste the printed https://...run.app/mcp URL into
 # claude.ai -> Settings -> Connectors -> Add custom connector
 ```
 
 The script is idempotent (re-run it after any failure) and prints the
-connector URL, the token, and a curl verification command at the end. For a
-guided, conversational path — preflight checks, key handling, common GCP
-failure fixes, teardown — use the `deploy-gcp` skill
-(`.claude/skills/deploy-gcp/SKILL.md`) from Claude Code.
+connector URL and a verification command at the end. For a guided,
+conversational path — preflight checks, key handling, common GCP failure
+fixes, teardown — use the `deploy-gcp` skill from Claude Code.
+
+### Authentication modes (`AUTH_MODE`)
+
+The deploy defaults to **`oauth-secret`** — the right balance of secure and
+frictionless, and it needs no external accounts:
+
+- **`oauth-secret`** (default) — claude.ai performs a real OAuth handshake
+  (Dynamic Client Registration + authorization-code + PKCE) against the server;
+  you approve once by typing a generated **access code** on a page the server
+  hosts, after which a short-lived JWT rides the `Authorization` header. The
+  secret never appears in the connector URL. Leave the connector's OAuth
+  Client ID/Secret blank — discovery is automatic. Zero extra setup.
+- **`oauth-google`** (opt-in: `AUTH_MODE=oauth-google`) — Google sign-in gated
+  by an email allowlist (`ALLOWED_EMAILS`), for per-person identity. Costs each
+  deployer a one-time Google OAuth web client created in the Cloud console
+  (gcloud can't); redirect URI `<service-url>/auth/google/callback`. See
+  `src/patentkit/integrations/mcp_oauth.py`.
+- **`token`** (opt-in: `AUTH_MODE=token`) — a static bearer secret carried in
+  the connector URL. Simplest, least hygienic (token lands in logs/history);
+  fine for a throwaway demo.
