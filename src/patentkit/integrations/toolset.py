@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
@@ -60,6 +61,15 @@ the list above>", "why": "<one sentence: added/argued and against what \
 rejection or art>"}}], "summary": "<2-3 sentence narrative of how the claim \
 was allowed>"}}
 """
+
+
+#: e.g. "US10491679B2", "US 2006/0235700 A1", "EP1234567A1" — a country code
+#: followed by digits (with optional separators/kind code), nothing word-like
+_PATENT_NUMBER_RE = re.compile(r"^[A-Z]{2}\s?[\d/,.\s-]{5,}\s?[A-Z]?\d?$")
+
+
+def _looks_like_patent_number(term: str) -> bool:
+    return bool(term) and bool(_PATENT_NUMBER_RE.match(term.strip().upper()))
 
 
 def _result_dict(result: SearchResult) -> dict:
@@ -276,6 +286,30 @@ class PatentToolset:
         cutoffs (YYYY-MM-DD), country codes, and an exclude list of patent
         numbers. Returns ranked results with highlighted passages.
         """
+        # Patent-number-shaped terms never match text fields (BM25 searches
+        # title/abstract/claims/spec, not the number field) — resolve them by
+        # number lookup instead of returning a misleading empty/noise result.
+        number_terms = [t for t in [*(keywords or []), text or ""] if _looks_like_patent_number(t)]
+        if number_terms:
+            looked_up = []
+            for term in number_terms:
+                found = self.keyword_store.get(PatentNumber.parse(term))
+                looked_up.append({
+                    "number": term,
+                    "indexed": found is not None,
+                    **({"title": found.title} if found is not None else {}),
+                })
+            return {
+                "note": (
+                    "Query terms look like patent numbers; text search does not "
+                    "match numbers, so they were resolved by direct index lookup "
+                    "instead. Use get_patent to fetch a full record."
+                ),
+                "lookups": looked_up,
+                "count": len(looked_up),
+                "results": [],
+            }
+
         spec = QuerySpec(
             keywords=keywords or [],
             required_keywords=required_keywords or [],
@@ -968,15 +1002,20 @@ def _spec(name: str, description: str, properties: dict, required: list[str] | N
 TOOL_SPECS: list[dict] = [
     _spec(
         "search_patents",
-        "Call this for a quick one-off lookup over the indexed patent corpus "
-        "(BM25 keyword search with metadata filters) — e.g. to check what is "
-        "indexed or sanity-check a query idea. For a real prior-art / FTO / "
-        "infringement investigation, prefer guided_search_start, which runs "
-        "an agentic multi-query search. Supports the full query parameter "
-        "set: keywords, required/excluded keywords, free text, minimum-match, "
-        "field selection, CPC art classes, inventors, assignees, date "
-        "cutoffs, countries, and exclusions; returns ranked patents with "
-        "highlighted passages.",
+        "Call this ONLY for a quick single-shot lookup over the indexed "
+        "corpus (BM25 keyword search with metadata filters) — sanity checks, "
+        "browsing what is indexed. Do NOT run a prior-art / FTO / "
+        "infringement search by iterating this tool yourself: call "
+        "guided_search_start then guided_search_execute instead — they run "
+        "patentkit's search agent (budgeted multi-query refinement loop with "
+        "tool-layer exclusions and a saved reasoning trace), which is "
+        "strictly better at it. To check whether a specific patent is "
+        "indexed, or to fetch one, use get_patent with its number — text "
+        "search does not match patent numbers. Supports keywords, "
+        "required/excluded keywords, free text, minimum-match, field "
+        "selection, CPC art classes, inventors, assignees, date cutoffs, "
+        "countries, exclusions; returns ranked patents with highlighted "
+        "passages.",
         dict(_SEARCH_QUERY_PROPERTIES),
     ),
     _spec(

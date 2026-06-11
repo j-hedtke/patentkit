@@ -474,3 +474,21 @@ def test_search_trace_markdown_is_round_grouped_narrative(tmp_path) -> None:
     trace2 = dispatch(toolset, "get_search_trace", {"session_id": session_id})
     assert "## Injected user feedback" in trace2["markdown"]
     assert "focus on mesh networking" in trace2["markdown"]
+
+
+def test_search_patents_resolves_patent_number_queries_by_lookup(tmp_path) -> None:
+    """Patent-number-shaped query terms never match BM25 text fields; the tool
+    must answer with a direct number lookup + guidance instead of noise."""
+    from patentkit.integrations.toolset import _looks_like_patent_number
+
+    assert _looks_like_patent_number("US10491679B2")
+    assert _looks_like_patent_number("US 2006/0235700 A1")
+    assert not _looks_like_patent_number("voice command interface")
+
+    ts = make_toolset(tmp_path, FakeLLM())
+    indexed = str(ts.keyword_store.all_patents()[0].patent_number)
+    out = ts.search_patents(keywords=[indexed])
+    assert out["results"] == [] and out["lookups"][0]["indexed"] is True
+    missing = ts.search_patents(text="US99999999B9")
+    assert missing["lookups"][0]["indexed"] is False
+    assert "get_patent" in missing["note"]
