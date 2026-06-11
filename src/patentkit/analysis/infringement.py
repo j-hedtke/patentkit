@@ -12,10 +12,9 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from patentkit.analysis.claims_analysis import split_atomic_limitations
 from patentkit.analysis.prompts import INFRINGEMENT_ANALYSIS
 from patentkit.llm.base import LLM, get_llm
-from patentkit.models import AtomicLimitation, Patent
+from patentkit.models import Limitation, Patent
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +34,7 @@ class EvidenceItem(BaseModel):
 class InfringementFinding(BaseModel):
     """Whether the product evidence shows one limitation is met."""
 
-    limitation: AtomicLimitation
+    limitation: Limitation
     status: InfringementStatus
     evidence: list[EvidenceItem] = Field(default_factory=list)
     reasoning: str = ""
@@ -74,17 +73,16 @@ def analyze_infringement(
         llm: HIGH-effort LLM (defaults via ``get_llm("high")``).
 
     One :data:`~patentkit.analysis.prompts.INFRINGEMENT_ANALYSIS` call per
-    limitation. Limitations come from ``claim.atomic_limitations`` when
-    precomputed, otherwise from :func:`split_atomic_limitations`.
+    limitation. Limitations are the claim's PRECOMPUTED units from
+    ``claim.get_limitations()`` (deterministic — no LLM is used for
+    splitting).
     """
     claim = patent.get_claim(claim_number)
     if claim is None:
         raise ValueError(f"Claim {claim_number} not found in {patent.patent_number}")
     llm = llm or get_llm("high")
 
-    limitations: list[AtomicLimitation] = (
-        claim.atomic_limitations or split_atomic_limitations(claim, patent, llm=llm)
-    )
+    limitations: list[Limitation] = claim.get_limitations()
     corpus = "\n\n".join(
         f'<evidence source="{source}">\n{text}\n</evidence>' for source, text in evidence_texts
     )

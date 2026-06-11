@@ -1,12 +1,12 @@
 from patentkit.models.patent import (
     Assignee,
-    AtomicLimitation,
     Citation,
     Claim,
     ClaimElement,
     Classification,
     Figure,
     Inventor,
+    Limitation,
     Patent,
     PatentNumber,
     SourceRecord,
@@ -16,13 +16,13 @@ from patentkit.models.patent import (
 
 __all__ = [
     "Assignee",
-    "AtomicLimitation",
     "Citation",
     "Claim",
     "ClaimElement",
     "Classification",
     "Figure",
     "Inventor",
+    "Limitation",
     "Patent",
     "PatentNumber",
     "SourceRecord",

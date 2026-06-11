@@ -13,7 +13,7 @@ import logging
 from typing import Optional, Sequence
 
 from patentkit.analysis.invalidity import ClaimChart, DisclosureFinding, ReferenceChart
-from patentkit.models import AtomicLimitation
+from patentkit.models import Limitation
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ _STATUS_CSS = {
 
 
 def _finding_for(
-    reference: ReferenceChart, limitation: AtomicLimitation, index: int
+    reference: ReferenceChart, limitation: Limitation, index: int
 ) -> Optional[DisclosureFinding]:
     """Find the reference's finding for ``limitation`` (by position, then text)."""
     if index < len(reference.findings) and reference.findings[index].limitation.text == limitation.text:
@@ -62,6 +62,13 @@ def _ref_header(reference: ReferenceChart) -> str:
 
 def _md_escape(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", "<br>")
+
+
+def _limitation_md(limitation: Limitation) -> str:
+    """Limitation cell: bold bracket label (e.g. **1[b]**) + verbatim text."""
+    if limitation.label:
+        return f"**{_md_escape(limitation.label)}** {_md_escape(limitation.text)}"
+    return _md_escape(limitation.text)
 
 
 def _finding_cell_markdown(finding: Optional[DisclosureFinding]) -> str:
@@ -87,7 +94,7 @@ def claim_chart_markdown(chart: ClaimChart) -> str:
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join([" --- "] * len(headers)) + "|")
     for i, limitation in enumerate(chart.limitations):
-        cells = [_md_escape(limitation.text)]
+        cells = [_limitation_md(limitation)]
         for ref in chart.references:
             cells.append(_finding_cell_markdown(_finding_for(ref, limitation, i)))
         lines.append("| " + " | ".join(cells) + " |")
@@ -130,13 +137,14 @@ def filter_chart(chart: ClaimChart, limitation_substrings: Sequence[str]) -> Cla
     )
 
 
-def limitation_chart_markdown(chart: ClaimChart, limitation: AtomicLimitation) -> str:
+def limitation_chart_markdown(chart: ClaimChart, limitation: Limitation) -> str:
     """Render one limitation's disclosure across references: one row per
     reference with status, reasoning, and quotes/citation."""
+    label = f" {limitation.label}" if limitation.label else ""
     lines = [
         f"## Limitation Chart — {chart.query_patent}, Claim {chart.claim_number}",
         "",
-        f"**Limitation:** {_md_escape(limitation.text)}",
+        f"**Limitation{label}:** {_md_escape(limitation.text)}",
         "",
         "| Reference | Status | Reasoning | Quotes |",
         "| --- | --- | --- | --- |",
@@ -168,7 +176,8 @@ def claim_chart_html(chart: ClaimChart) -> str:
     )
     rows.append(f"<tr>{header_cells}</tr>")
     for i, limitation in enumerate(chart.limitations):
-        cells = [f"<td>{esc(limitation.text)}</td>"]
+        label_html = f"<b>{esc(limitation.label)}</b> " if limitation.label else ""
+        cells = [f"<td>{label_html}{esc(limitation.text)}</td>"]
         for ref in chart.references:
             finding = _finding_for(ref, limitation, i)
             if finding is None:
@@ -234,7 +243,12 @@ def claim_chart_docx(chart: ClaimChart, out_path: str, color_coding: bool = True
 
     for i, limitation in enumerate(chart.limitations):
         row = table.add_row().cells
-        row[0].text = limitation.text
+        if limitation.label:
+            limitation_par = row[0].paragraphs[0]
+            limitation_par.add_run(limitation.label).bold = True
+            limitation_par.add_run(f" {limitation.text}")
+        else:
+            row[0].text = limitation.text
         for j, ref in enumerate(chart.references):
             cell = row[j + 1]
             finding = _finding_for(ref, limitation, i)

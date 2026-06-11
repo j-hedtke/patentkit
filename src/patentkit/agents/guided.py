@@ -34,6 +34,7 @@ import json
 import logging
 import time
 import uuid
+from datetime import date
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
@@ -51,6 +52,7 @@ from patentkit.agents.planner import (
     plan_search,
     revise_plan,
 )
+from patentkit.graph import expand_limitation, harvest_match_pairs
 from patentkit.models import Patent, PatentNumber
 
 logger = logging.getLogger(__name__)
@@ -125,14 +127,27 @@ class GuidedSearch:
             keys-free degraded mode (single keyword pass per execution).
         session_store: optional :class:`SessionStore`; sessions are saved
             into it after every transition when provided.
+        concept_graph: optional :class:`patentkit.graph.ConceptGraph` (any
+            ``ConceptBackend``); when configured, known concept aliases for
+            the key limitations are injected into the agent's context as
+            ADDITIONAL QUERY ANGLES on the first execution (same
+            persisted-user-message channel as ``key_limitations``).
+        match_pair_store: optional :class:`patentkit.graph.MatchPairStore`
+            (any ``MatchPairBackend``); when configured, every execution's
+            results are harvested into it as unreviewed match pairs, and
+            result feedback naming a patent flips its pairs to
+            accepted/rejected — the residue the concept graph grows from.
     """
 
     def __init__(self, keyword_store=None, vector_store=None, llm=None,
-                 session_store: Optional[SessionStore] = None):
+                 session_store: Optional[SessionStore] = None,
+                 concept_graph=None, match_pair_store=None):
         self.keyword_store = keyword_store
         self.vector_store = vector_store
         self.llm = llm
         self.session_store = session_store
+        self.concept_graph = concept_graph
+        self.match_pair_store = match_pair_store
 
     # ------------------------------------------------------------- plumbing
     def _save(self, session: GuidedSearchSession) -> GuidedSearchSession:
@@ -261,6 +276,7 @@ class GuidedSearch:
         for result in feedback.results:  # hard exclusions, enforced at the tool layer
             if result.relevant is False and result.patent_number not in session.plan.exclusions:
                 session.plan.exclusions.append(result.patent_number)
+        self._record_feedback_outcomes(session, feedback)
         session.iteration += 1
         session.state = "searching"
         return self._save(session)
@@ -354,6 +370,7 @@ class GuidedSearch:
         session.params["stop_reason"] = result.stop_reason
         session.params["elapsed_seconds"] = round(time.monotonic() - t0, 3)
         session.state = "awaiting_result_feedback"
+        self._harvest_round(session)
         return self._save(session)
 
     def finish(self, session: GuidedSearchSession) -> GuidedSearchSession:
@@ -362,13 +379,12 @@ class GuidedSearch:
         return self._save(session)
 
     # -------------------------------------------------------------- helpers
-    @staticmethod
-    def _drain_feedback(session: GuidedSearchSession) -> list[str]:
+    def _drain_feedback(self, session: GuidedSearchSession) -> list[str]:
         """Consume queued pre-run guidance + result feedback for injection."""
         messages: list[str] = []
         if not session.params.get("conversation"):
             # first run: seed the agent with the plan's angles, key
-            # limitations, and plan feedback
+            # limitations, concept-graph aliases, and plan feedback
             plan = session.plan
             if plan is not None and plan.queries:
                 angles = "; ".join(
@@ -380,11 +396,69 @@ class GuidedSearch:
                     "Key claim limitations to prioritize (e.g. added or argued "
                     "for allowance — the strongest prior art should disclose "
                     "these):\n" + "\n".join(f"- {k}" for k in key_limitations))
+            concept_angles = self._concept_angles(key_limitations)
+            if concept_angles:
+                messages.append(
+                    "ADDITIONAL QUERY ANGLES (canonical concept aliases learned "
+                    "from previously accepted searches — try these phrasings "
+                    "too):\n" + "\n".join(f"- {a}" for a in concept_angles))
             messages += session.params.get("pre_run_guidance") or []
             session.params["pre_run_guidance"] = []
         messages += session.params.get("pending_feedback") or []
         session.params["pending_feedback"] = []
         return messages
+
+    # -------------------------------------------------- concept-graph residue
+    def _concept_angles(self, limitations: list[str]) -> list[str]:
+        """Known aliases for the key limitations from the configured graph."""
+        if self.concept_graph is None or not limitations:
+            return []
+        angles: list[str] = []
+        for limitation in limitations:
+            for alias in expand_limitation(self.concept_graph, limitation):
+                if alias not in angles:
+                    angles.append(alias)
+        return angles
+
+    def _harvest_round(self, session: GuidedSearchSession) -> None:
+        """Record this execution's matches as unreviewed match pairs — the
+        residue the concept graph later crystallizes from."""
+        if self.match_pair_store is None or not session.last_results:
+            return
+        limitations = list(session.params.get("key_limitations") or [])
+        if not limitations:
+            patent = self._session_patent(session)
+            if patent is not None:
+                limitations = [c.text for c in
+                               (patent.independent_claims or list(patent.claims))[:3]]
+        try:
+            pairs = harvest_match_pairs(
+                session.last_results, limitations=limitations,
+                search_id=session.id, created_at=date.today().isoformat())
+            for pair in pairs:
+                self.match_pair_store.add(pair)
+        except Exception:  # noqa: BLE001 — harvesting must never break a search
+            logger.warning("match-pair harvesting failed for session %s",
+                           session.id, exc_info=True)
+
+    def _record_feedback_outcomes(self, session: GuidedSearchSession,
+                                  feedback: SearchFeedback) -> None:
+        """Flip this session's harvested pairs to accepted/rejected where the
+        feedback names a patent."""
+        if self.match_pair_store is None:
+            return
+        for result in feedback.results:
+            if result.relevant is None:
+                continue
+            try:
+                self.match_pair_store.mark_outcome(
+                    result.patent_number,
+                    "accepted" if result.relevant else "rejected",
+                    search_id=session.id,
+                    feedback_type="teaches_limitation" if result.relevant else None)
+            except Exception:  # noqa: BLE001 — feedback recording is best-effort
+                logger.warning("match-pair outcome update failed for %s",
+                               result.patent_number, exc_info=True)
 
     @staticmethod
     def _session_patent(session: GuidedSearchSession) -> Optional[Patent]:

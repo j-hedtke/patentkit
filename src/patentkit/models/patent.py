@@ -61,13 +61,18 @@ class ClaimElement(BaseModel):
     children: list["ClaimElement"] = Field(default_factory=list)
 
 
-class AtomicLimitation(BaseModel):
-    """The smallest separately-assessable requirement of a claim.
+class Limitation(BaseModel):
+    """One precomputed structural unit of a claim.
 
-    ``span`` locates the limitation in the claim text as (start, end) character
-    offsets, when known.
+    Limitations are stable, verbatim segments of the claim text, computed at
+    index/parse time by :func:`patentkit.parsing.claims.split_limitations`
+    (NOT an LLM analysis step). ``label`` is the claim number plus a bracket
+    letter ("1[a]", "1[b]"; the preamble is "1[pre]"); ``text`` is the
+    VERBATIM contiguous claim segment; ``span`` locates it in the claim text
+    as (start, end) character offsets, when known.
     """
 
+    label: str
     text: str
     span: Optional[tuple[int, int]] = None
 
@@ -77,11 +82,25 @@ class Claim(BaseModel):
     text: str
     depends_on: Optional[int] = None
     elements: list[ClaimElement] = Field(default_factory=list)
-    atomic_limitations: list[AtomicLimitation] = Field(default_factory=list)
+    limitations: list[Limitation] = Field(default_factory=list)
 
     @property
     def is_independent(self) -> bool:
         return self.depends_on is None
+
+    def get_limitations(self) -> list[Limitation]:
+        """The claim's precomputed limitations, lazily computed and cached.
+
+        Records serialized before limitations existed (e.g. the eval corpus
+        JSONL) deserialize with an empty ``limitations`` list; this accessor
+        runs the deterministic structural splitter on first use and caches
+        the result on the model, so old records keep working without a
+        rescrape.
+        """
+        if not self.limitations:
+            from patentkit.parsing.claims import split_limitations  # noqa: PLC0415 — avoid models<->parsing cycle
+            self.limitations = split_limitations(self.text, self.number)
+        return self.limitations
 
 
 class Citation(BaseModel):

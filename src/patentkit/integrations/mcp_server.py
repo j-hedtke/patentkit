@@ -1,19 +1,24 @@
-"""MCP stdio server exposing the :class:`PatentToolset`.
+"""MCP server exposing the :class:`PatentToolset` (stdio by default).
 
 One MCP Tool is registered per :data:`~patentkit.integrations.toolset.
 TOOL_SPECS` entry (the hand-written JSON schemas pass straight through), and
 calls dispatch to a single shared toolset. Run it with the console script::
 
-    patentkit-mcp
+    patentkit-mcp                # stdio (Claude Desktop / local clients)
+    patentkit-mcp --http [port]  # streamable HTTP (claude.ai custom connectors)
 
 Environment configuration:
 
-- ``PATENTKIT_PROVIDER``      "anthropic" or "openai" — LLM for planning/reranking
-- ``PATENTKIT_SESSION_DIR``   directory for guided-session JSON persistence
-- ``PATENTKIT_INDEX_JSONL``   a .jsonl corpus of Patent records preloaded at startup
-- ``USPTO_ODP_API_KEY``       enables file-wrapper context in summarize_key_limitations
+- ``PATENTKIT_PROVIDER``       "anthropic" or "openai" — LLM for planning/reranking
+- ``PATENTKIT_SESSION_DIR``    directory for guided-session JSON persistence
+- ``PATENTKIT_INDEX_JSONL``    a .jsonl corpus of Patent records preloaded at startup
+- ``USPTO_ODP_API_KEY``        enables file-wrapper context in summarize_key_limitations
+- ``PATENTKIT_MCP_TRANSPORT``  "http" selects the streamable-http transport
+  (equivalent to ``--http``); anything else keeps the stdio default. See
+  :mod:`patentkit.integrations.mcp_http` for HOST/PORT/TOKEN variables.
 
-Requires the ``mcp`` extra: ``pip install 'patentkit[mcp]'``.
+Requires the ``mcp`` extra: ``pip install 'patentkit[mcp]'`` (stdio), or
+``pip install 'patentkit[mcp-http]'`` for HTTP mode.
 """
 
 from __future__ import annotations
@@ -86,11 +91,46 @@ async def _serve() -> None:
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-def main() -> None:
-    """Console entry point (``patentkit-mcp``): run the stdio MCP server."""
+def _select_transport(argv: list[str], env: dict[str, str]) -> tuple[str, int | None]:
+    """Pick the transport from CLI args / environment.
+
+    Returns ``("http", port_or_None)`` when ``--http [port]`` is passed or
+    ``PATENTKIT_MCP_TRANSPORT=http`` is set, else ``("stdio", None)``. The CLI
+    flag wins over the environment; a missing port defers to
+    ``PATENTKIT_MCP_PORT`` / the default in :mod:`patentkit.integrations.mcp_http`.
+    """
+    if "--http" in argv:
+        idx = argv.index("--http")
+        port = None
+        if idx + 1 < len(argv) and argv[idx + 1].isdigit():
+            port = int(argv[idx + 1])
+        return "http", port
+    if env.get("PATENTKIT_MCP_TRANSPORT", "").strip().lower() == "http":
+        return "http", None
+    return "stdio", None
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Console entry point (``patentkit-mcp``): run the MCP server.
+
+    stdio by default; ``--http [port]`` or ``PATENTKIT_MCP_TRANSPORT=http``
+    selects the streamable-http transport for remote clients (claude.ai).
+    """
     import asyncio
+    import sys
 
     logging.basicConfig(level=os.environ.get("PATENTKIT_LOG_LEVEL", "INFO"))
+    transport, port = _select_transport(
+        sys.argv[1:] if argv is None else argv, dict(os.environ)
+    )
+    if transport == "http":
+        from patentkit.integrations.mcp_http import serve_http  # noqa: PLC0415
+
+        try:
+            serve_http(port=port)
+        except ImportError as exc:
+            raise SystemExit(str(exc)) from exc
+        return
     try:
         asyncio.run(_serve())
     except ImportError as exc:

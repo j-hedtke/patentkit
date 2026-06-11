@@ -10,6 +10,7 @@ from patentkit.parsing.claims import (
     claim_element_outline,
     extract_claims_section,
     parse_claims,
+    split_limitations,
 )
 from patentkit.parsing.documents import extract_text, html_to_text
 from patentkit.parsing.patent_pdf import (
@@ -28,6 +29,7 @@ __all__ = [
     "claim_element_outline",
     "extract_claims_section",
     "parse_claims",
+    "split_limitations",
     "extract_text",
     "html_to_text",
     "LineMarker",

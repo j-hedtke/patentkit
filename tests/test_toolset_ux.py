@@ -18,13 +18,17 @@ from patentkit.models import Claim, Patent, PatentNumber
 from patentkit.search.bm25 import BM25Store
 from tests.fakes import FakeLLM
 
-# Claim of the target patent; the split segments below are verbatim slices.
-CLAIM = ("1. An irrigation system comprising wireless soil moisture sensor "
-         "nodes and a controller scheduling watering of zones.")
-LIM_PREAMBLE = "1. An irrigation system comprising"
-LIM_SENSORS = "wireless soil moisture sensor nodes"
+# Claim of the target patent; limitations are PRECOMPUTED structural units
+# (deterministic split — preamble at "comprising", elements at ";"), so the
+# segments below are exactly what Claim.get_limitations() yields. No LLM
+# call is ever needed for splitting.
+CLAIM = ("1. An irrigation system comprising: wireless soil moisture sensor "
+         "nodes; and a controller scheduling watering of zones.")
+LIM_PREAMBLE = "1. An irrigation system comprising:"
+LIM_SENSORS = "wireless soil moisture sensor nodes; and"
 LIM_CONTROLLER = "a controller scheduling watering of zones."
-SPLIT_RESPONSE = [LIM_PREAMBLE, LIM_SENSORS, LIM_CONTROLLER]
+LIMITATIONS = [LIM_PREAMBLE, LIM_SENSORS, LIM_CONTROLLER]
+LABELS = ["1[pre]", "1[a]", "1[b]"]
 
 
 def make_patent(number: str, title: str, claim: str, spec: str, priority: date,
@@ -77,9 +81,12 @@ def assess(status: str, reasoning: str, quotes: list[str]) -> dict:
 
 
 def chart_llm(extra_responses: list | None = None) -> FakeLLM:
-    """FakeLLM scripted for one build_claim_chart against US7000001B1."""
+    """FakeLLM scripted for one build_claim_chart against US7000001B1.
+
+    Splitting is deterministic (no LLM call), so only the three per-
+    limitation disclosure assessments are scripted.
+    """
     return FakeLLM(responses=[
-        SPLIT_RESPONSE,
         assess("disclosed", "irrigation system taught", ["an irrigation controller"]),
         assess("disclosed", "mesh sensor nodes taught", ["sensor node transmitting readings"]),
         assess("partial", "scheduling only implied", ["controller scheduling watering"]),
@@ -98,12 +105,13 @@ def test_build_claim_chart_returns_markdown_and_structured_fields(tmp_path) -> N
     assert "error" not in out
     json.dumps(out)
     # structured fields preserved for programmatic use
-    assert [lim["text"] for lim in out["limitations"]] == SPLIT_RESPONSE
+    assert [lim["text"] for lim in out["limitations"]] == LIMITATIONS
+    assert [lim["label"] for lim in out["limitations"]] == LABELS
     assert out["coverage_summary"]["US7000001B1"] == pytest.approx(2 / 3)
-    # ready-to-display markdown
+    # ready-to-display markdown: bold bracket label + verbatim text
     md = out["markdown"]
     assert md.startswith("## Claim Chart — US8123456B2, Claim 1")
-    assert LIM_CONTROLLER in md
+    assert f"**1[b]** {LIM_CONTROLLER}" in md
     assert "US7000001B1 (Wireless soil moisture sensor network)" in md
     assert "**Disclosed**" in md and "**Partial**" in md
     assert "“controller scheduling watering”" in md
@@ -149,7 +157,7 @@ def test_chart_limitation_reuses_cached_assessments(tmp_path) -> None:
         "patent_number": "US8123456B2", "claim_number": 1,
         "reference_numbers": ["US7000001B1"],
     })
-    calls_after_chart = len(llm.prompts)  # 1 split + 3 assess
+    calls_after_chart = len(llm.prompts)  # 3 assess (split is deterministic)
 
     # same limitation + same reference: fully served from the cache
     out = dispatch(toolset, "chart_limitation", {
@@ -162,6 +170,7 @@ def test_chart_limitation_reuses_cached_assessments(tmp_path) -> None:
     assert out["reused_assessments"] == ["US7000001B1"]
     assert out["new_assessments"] == []
     assert out["limitation"] == LIM_CONTROLLER
+    assert out["label"] == "1[b]"
     md = out["markdown"]
     assert md.startswith("## Limitation Chart — US8123456B2, Claim 1")
     assert LIM_CONTROLLER in md
@@ -183,7 +192,7 @@ def test_chart_limitation_reuses_cached_assessments(tmp_path) -> None:
 
 def test_chart_limitation_without_prior_chart(tmp_path) -> None:
     llm = FakeLLM(responses=[
-        SPLIT_RESPONSE,
+        # no split response needed — limitations are precomputed
         assess("disclosed", "scheduling controller taught", ["controller scheduling watering"]),
     ])
     toolset = make_toolset(tmp_path, llm)
@@ -201,7 +210,7 @@ def test_chart_limitation_without_prior_chart(tmp_path) -> None:
 
 
 def test_chart_limitation_unknown_limitation_errors_helpfully(tmp_path) -> None:
-    toolset = make_toolset(tmp_path, FakeLLM(responses=[SPLIT_RESPONSE]))
+    toolset = make_toolset(tmp_path, FakeLLM())  # no LLM calls expected at all
     out = dispatch(toolset, "chart_limitation", {
         "limitation": "a quantum flux capacitor",
         "patent": "US8123456B2", "claim_number": 1,
@@ -264,14 +273,13 @@ def test_summarize_key_limitations_degrades_without_odp_key(tmp_path, monkeypatc
     })
     assert out["mode"] == "claim_split_only"
     assert "USPTO_ODP_API_KEY" in out["note"]
-    # deterministic structural split, all limitations returned
-    assert out["key_limitations"]
-    assert any("controller scheduling watering of zones" in lim
-               for lim in out["key_limitations"])
+    # the PRECOMPUTED limitations are returned — no LLM needed at all
+    assert out["key_limitations"] == LIMITATIONS
+    assert [lim["label"] for lim in out["limitations"]] == LABELS
     md = out["markdown"]
     assert md.startswith("## Claim limitations — US8123456B2, claim 1")
     assert "USPTO_ODP_API_KEY" in md
-    assert "controller scheduling watering of zones" in md
+    assert f"- **1[b]** {LIM_CONTROLLER}" in md
     json.dumps(out)
 
 
@@ -287,7 +295,7 @@ def test_summarize_key_limitations_uses_enriched_file_wrapper(tmp_path, monkeypa
     )
     store.index([enriched])
     llm = FakeLLM(responses=[
-        SPLIT_RESPONSE,
+        # only the wrapper-summarization call — splitting is deterministic
         {"key_limitations": [{"limitation": LIM_CONTROLLER,
                               "why": "added by amendment to overcome Smith"}],
          "summary": "Allowance followed the controller-scheduling amendment."},
@@ -324,7 +332,6 @@ def test_summarize_key_limitations_fetches_wrapper_with_key(tmp_path, monkeypatc
     monkeypatch.setenv("USPTO_ODP_API_KEY", "test-key")
     monkeypatch.setattr(fw, "FileWrapperClient", StubClient)
     llm = FakeLLM(responses=[
-        SPLIT_RESPONSE,
         {"key_limitations": [{"limitation": "controller scheduling watering",
                               "why": "argued for allowance"}],
          "summary": "Argued, not amended."},

@@ -12,13 +12,13 @@ from patentkit.formatting import (
     infringement_report_markdown,
     invalidity_report_markdown,
 )
-from patentkit.models import AtomicLimitation, Patent, PatentNumber
+from patentkit.models import Limitation, Patent, PatentNumber
 from patentkit.search.base import Passage, SearchResult
 
 
 def make_chart() -> ClaimChart:
-    lim_a = AtomicLimitation(text="a frame supporting the housing")
-    lim_b = AtomicLimitation(text="a motor coupled to the frame")
+    lim_a = Limitation(label="1[a]", text="a frame supporting the housing")
+    lim_b = Limitation(label="1[b]", text="a motor coupled to the frame")
     return ClaimChart(
         query_patent="US10123456B2",
         claim_number=1,
@@ -57,7 +57,9 @@ class TestClaimChartMarkdown:
     def test_contains_expected_cells(self):
         md = claim_chart_markdown(make_chart())
         assert "Claim Chart — US10123456B2, Claim 1" in md
-        assert "a frame supporting the housing" in md
+        # bold bracket label prefixes the verbatim limitation text
+        assert "**1[a]** a frame supporting the housing" in md
+        assert "**1[b]** a motor coupled to the frame" in md
         assert "US111 (Prior Widget)" in md
         assert "US222" in md
         assert "**Disclosed**" in md
@@ -75,7 +77,7 @@ class TestClaimChartMarkdown:
     def test_html_rendering(self):
         html = claim_chart_html(make_chart())
         assert "<table" in html
-        assert "a frame supporting the housing" in html
+        assert "<b>1[a]</b> a frame supporting the housing" in html
         assert "background-color:#c6efce" in html  # disclosed = green
         assert "col. 2, ll. 10-12" in html
 
@@ -173,7 +175,7 @@ class TestInfringementReport:
         patent = Patent(patent_number=PatentNumber.parse("US555"), title="Pump")
         findings = [
             InfringementFinding(
-                limitation=AtomicLimitation(text="a sealed impeller"),
+                limitation=Limitation(label="1[a]", text="a sealed impeller"),
                 status="met",
                 evidence=[
                     EvidenceItem(
@@ -185,7 +187,7 @@ class TestInfringementReport:
                 reasoning="Product page confirms it.",
             ),
             InfringementFinding(
-                limitation=AtomicLimitation(text="a titanium shaft"),
+                limitation=Limitation(label="1[b]", text="a titanium shaft"),
                 status="not_met",
                 reasoning="Shaft is steel.",
             ),

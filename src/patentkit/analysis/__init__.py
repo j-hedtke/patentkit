@@ -1,5 +1,9 @@
-"""Analysis skills: claim interpretation/splitting, invalidity claim charts,
-FTO, infringement, drafting, and keyword generation.
+"""Analysis skills: claim interpretation, optional limitation refinement,
+invalidity claim charts, FTO, infringement, drafting, and keyword generation.
+
+Limitation SPLITTING is not done here: claims carry precomputed
+:class:`~patentkit.models.Limitation` units from the deterministic splitter
+in :mod:`patentkit.parsing.claims` (see ``Claim.get_limitations()``).
 
 Every LLM-backed function accepts ``llm: LLM | None = None`` and defaults via
 ``get_llm`` at the documented effort tier (LOW extraction/formatting, MEDIUM
@@ -9,7 +13,7 @@ interpretation/passage selection, HIGH assessment/charting/drafting).
 from patentkit.analysis.claims_analysis import (
     generate_keywords,
     interpret_claim,
-    split_atomic_limitations,
+    refine_limitations,
 )
 from patentkit.analysis.drafting import (
     check_antecedent_basis,
@@ -33,7 +37,7 @@ from patentkit.analysis.invalidity import (
 __all__ = [
     "generate_keywords",
     "interpret_claim",
-    "split_atomic_limitations",
+    "refine_limitations",
     "check_antecedent_basis",
     "draft_claims",
     "draft_spec_section",

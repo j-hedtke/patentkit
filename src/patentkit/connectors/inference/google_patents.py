@@ -35,6 +35,7 @@ from patentkit.models.patent import (
     SourceRecord,
     SpecSection,
 )
+from patentkit.parsing.claims import split_limitations
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +240,8 @@ class GooglePatentsScraper:
                 candidate = int(match.group(1))
                 if candidate != num:
                     depends_on = candidate
-            claims.append(Claim(number=num, text=text, depends_on=depends_on))
+            claims.append(Claim(number=num, text=text, depends_on=depends_on,
+                                limitations=split_limitations(text, num)))
         claims.sort(key=lambda c: c.number)
         return claims
 

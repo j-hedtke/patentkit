@@ -8,7 +8,7 @@ fences around the JSON.
 Constants:
 
 - :data:`INTERPRET_CLAIM` — interpret a claim in light of the specification.
-- :data:`SPLIT_ATOMIC_LIMITATIONS` — split a claim into atomic limitations.
+- :data:`REFINE_LIMITATIONS` — optionally merge/split the deterministic limitation units.
 - :data:`MAP_LIMITATION_SPANS` — map limitations to character spans in the claim.
 - :data:`ASSESS_DISCLOSURE` — does a reference disclose one limitation?
 - :data:`SELECT_PASSAGES` — verbatim supporting passages for a limitation.
@@ -43,27 +43,35 @@ and ordinary meaning. Return the full claim text with any annotations, preservin
 the original claim structure. Do not add commentary outside the claim text."""
 
 
-#: Split a claim into atomic limitations as a JSON list of strings (HIGH effort).
-#: Placeholders: {claim}.
-SPLIT_ATOMIC_LIMITATIONS = """\
-Split the following patent claim into atomic limitations — the smallest separately
-assessable requirements of the claim.
+#: Optionally refine the deterministic limitation units of a claim (HIGH effort).
+#: The deterministic structural split is the baseline; the model may merge or
+#: split segments but must stay verbatim and in order (enforced in code).
+#: Placeholders: {claim}, {segments} (the deterministic units, one per line).
+REFINE_LIMITATIONS = """\
+Here is a patent claim and a deterministic structural split of it into
+limitation segments (preamble, then elements split at semicolons).
 
 <claim>
 {claim}
 </claim>
 
+<segments>
+{segments}
+</segments>
+
+Refine the segmentation into the claim's limitations — the smallest separately
+assessable requirements. You may MERGE adjacent segments (when one element
+genuinely spans a semicolon) or SPLIT a segment (when it contains multiple
+separately assessable requirements); often the segments are already correct,
+in which case return them unchanged.
+
 Rules:
 1. Each limitation must be a VERBATIM, contiguous segment of the claim text.
    Copy it exactly as written — do NOT paraphrase, reword, abbreviate, expand,
    or normalize punctuation or capitalization.
-2. List the limitations in the order they appear in the claim (document order):
-   the preamble segment first (everything up to and including "comprising:" or
-   the equivalent transitional phrase), then each claim element verbatim, in
-   order.
-3. Do not reorder segments, and do not merge text across semicolons unless a
-   single element genuinely spans them.
-4. Together the segments must cover essentially ALL of the claim language,
+2. List the limitations in the order they appear in the claim (document
+   order), preamble first.
+3. Together the segments must cover essentially ALL of the claim language,
    including the preamble; do not drop any clause.
 
 Return ONLY a JSON list of strings, e.g. ["limitation 1", "limitation 2"]."""

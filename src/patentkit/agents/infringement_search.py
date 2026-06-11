@@ -82,8 +82,9 @@ def _limitations(patent: Patent, claims: Optional[list[int]]) -> list[str]:
         selected = patent.independent_claims or patent.claims
     texts: list[str] = []
     for claim in selected:
-        if claim.atomic_limitations:
-            texts += [lim.text for lim in claim.atomic_limitations]
+        limitations = claim.get_limitations()
+        if limitations:
+            texts += [lim.text for lim in limitations]
         else:
             texts.append(claim.text)
     return texts

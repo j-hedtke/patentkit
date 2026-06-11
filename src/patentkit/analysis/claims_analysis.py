@@ -1,7 +1,14 @@
-"""Claim-level analysis skills: interpretation, atomic-limitation splitting,
-and search-keyword generation.
+"""Claim-level analysis skills: interpretation, optional limitation
+refinement, and search-keyword generation.
 
-Every function accepts ``llm: LLM | None`` and defaults via
+Limitation SPLITTING is not an analysis step: claims carry precomputed
+:class:`~patentkit.models.Limitation` units assigned at parse time by the
+deterministic splitter in :func:`patentkit.parsing.claims.split_limitations`
+(reachable via :meth:`~patentkit.models.Claim.get_limitations`).
+:func:`refine_limitations` is an OPTIONAL LLM pass that may merge/split
+those deterministic segments, with verbatimness enforced in code.
+
+Every LLM-backed function accepts ``llm: LLM | None`` and defaults via
 :func:`patentkit.llm.base.get_llm` at the documented effort tier.
 """
 
@@ -9,21 +16,21 @@ from __future__ import annotations
 
 import difflib
 import logging
-import re
 from collections import Counter
 from typing import Optional
 
 from patentkit.analysis.prompts import (
     INTERPRET_CLAIM,
     KEYWORD_GENERATION,
-    SPLIT_ATOMIC_LIMITATIONS,
+    REFINE_LIMITATIONS,
 )
 from patentkit.llm.base import LLM, get_llm
-from patentkit.models import AtomicLimitation, Claim, Patent
+from patentkit.models import Claim, Limitation, Patent
+from patentkit.parsing.claims import element_label
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["interpret_claim", "split_atomic_limitations", "generate_keywords"]
+__all__ = ["interpret_claim", "refine_limitations", "generate_keywords"]
 
 
 def interpret_claim(claim: Claim, patent: Patent, llm: Optional[LLM] = None) -> str:
@@ -39,78 +46,86 @@ def interpret_claim(claim: Claim, patent: Patent, llm: Optional[LLM] = None) -> 
     return llm.complete(prompt, max_tokens=4096).text.strip()
 
 
-def split_atomic_limitations(
-    claim: Claim, patent: Optional[Patent] = None, llm: Optional[LLM] = None
-) -> list[AtomicLimitation]:
-    """Split ``claim`` into VERBATIM atomic limitations in document order.
+def refine_limitations(claim: Claim, llm: Optional[LLM] = None) -> list[Limitation]:
+    """OPTIONALLY refine ``claim``'s precomputed limitations with an LLM.
 
-    Each returned :class:`AtomicLimitation` is a contiguous, verbatim segment
-    of ``claim.text`` with ``span`` set to its (start, end) character offsets,
-    and the list is sorted by span start (preamble first, then each element in
-    order). Verbatimness is ENFORCED in code, not just in the prompt: every
-    LLM-returned limitation is located in the claim text after whitespace
-    normalization (case-sensitively, then case-insensitively) and replaced by
-    the exact claim slice. Items that cannot be located are snapped to the
-    nearest deterministic structural segment, or dropped with a warning —
-    paraphrased text is never kept.
+    The deterministic structural units from
+    :meth:`~patentkit.models.Claim.get_limitations` are the baseline; the LLM
+    may merge or split them (e.g. join an element that genuinely spans a
+    semicolon), but the result must remain VERBATIM, in-order, contiguous
+    segments of ``claim.text``. Verbatimness is ENFORCED in code, not just in
+    the prompt: every LLM-returned segment is located in the claim text after
+    whitespace normalization (case-sensitively, then case-insensitively) and
+    replaced by the exact claim slice. Segments that cannot be located are
+    snapped to the nearest deterministic structural unit, or dropped with a
+    warning — paraphrased text is never kept.
 
-    When ``llm`` is None, or when fewer than 2 returned limitations validate,
-    a deterministic structural splitter is used instead (preamble up to the
-    "comprising:"/"consisting of:" transition, then elements split on ";" /
-    "; and", delimiters kept), so the function works keys-free.
+    When ``llm`` is None, or when fewer than 2 returned segments validate,
+    the deterministic limitations are returned unchanged — chart building
+    never REQUIRES an LLM for splitting.
 
-    ``patent`` is currently unused beyond logging context but kept in the
-    signature so callers can supply specification context later.
+    Labels are reassigned in document order: a refined segment that exactly
+    matches the deterministic preamble keeps "N[pre]"; all other segments get
+    "N[a]", "N[b]", ...
     """
+    base = claim.get_limitations()
     if llm is None:
-        logger.info(
-            "No LLM provided for claim %d; using deterministic structural splitter",
-            claim.number,
-        )
-        return _structural_split(claim.text)
+        return base
 
-    raw = llm.complete_json(SPLIT_ATOMIC_LIMITATIONS.format(claim=claim.text), max_tokens=4096)
+    segments = "\n".join(f"- {lim.text}" for lim in base)
+    raw = llm.complete_json(
+        REFINE_LIMITATIONS.format(claim=claim.text, segments=segments), max_tokens=4096
+    )
     if not isinstance(raw, list):
         raise ValueError(f"Expected a JSON list of limitations, got {type(raw).__name__}")
     texts = [str(item).strip() for item in raw if str(item).strip()]
     if not texts:
-        logger.warning("LLM returned no atomic limitations for claim %d", claim.number)
-        return []
+        logger.warning("LLM returned no limitations for claim %d; keeping the "
+                       "deterministic split", claim.number)
+        return base
 
-    structural: Optional[list[AtomicLimitation]] = None
-    validated: list[AtomicLimitation] = []
+    validated_spans: list[tuple[int, int]] = []
     seen_spans: set[tuple[int, int]] = set()
     for text in texts:
         span = _locate_verbatim(claim.text, text)
         if span is None:
             # Never keep paraphrased text: snap to the nearest deterministic
-            # structural segment, or drop the item.
-            if structural is None:
-                structural = _structural_split(claim.text)
-            snapped = _snap_to_segment(text, structural)
-            if snapped is None:
+            # structural unit, or drop the item.
+            snapped = _snap_to_segment(text, base)
+            if snapped is None or snapped.span is None:
                 logger.warning(
                     "Dropping non-verbatim limitation %r (no close structural segment)", text
                 )
                 continue
             logger.warning("Limitation %r is not verbatim; snapped to %r", text, snapped.text)
             span = snapped.span
-        assert span is not None
         if span in seen_spans:
             continue
         seen_spans.add(span)
-        validated.append(AtomicLimitation(text=claim.text[span[0]:span[1]], span=span))
+        validated_spans.append(span)
 
-    if len(validated) < 2:
+    if len(validated_spans) < 2:
         logger.warning(
             "Only %d limitation(s) validated verbatim for claim %d; "
-            "falling back to deterministic structural split",
-            len(validated), claim.number,
+            "keeping the deterministic structural split",
+            len(validated_spans), claim.number,
         )
-        return _structural_split(claim.text)
+        return base
 
-    validated.sort(key=lambda lim: lim.span[0])  # type: ignore[index]
-    return validated
+    validated_spans.sort(key=lambda span: span[0])
+    preamble_span = (
+        base[0].span if base and base[0].label.endswith("[pre]") else None
+    )
+    refined: list[Limitation] = []
+    element_index = 0
+    for span in validated_spans:
+        if preamble_span is not None and span == preamble_span:
+            label = f"{claim.number}[pre]"
+        else:
+            label = element_label(claim.number, element_index)
+            element_index += 1
+        refined.append(Limitation(label=label, text=claim.text[span[0]:span[1]], span=span))
+    return refined
 
 
 def _normalize_with_map(text: str) -> tuple[str, list[int]]:
@@ -154,12 +169,12 @@ def _locate_verbatim(claim_text: str, limitation: str) -> Optional[tuple[int, in
 
 
 def _snap_to_segment(
-    text: str, segments: list[AtomicLimitation]
-) -> Optional[AtomicLimitation]:
+    text: str, segments: list[Limitation]
+) -> Optional[Limitation]:
     """Snap a non-verbatim limitation to its closest structural segment, or
     None when nothing is close enough (similarity ratio below 0.6)."""
     norm = " ".join(text.split()).lower()
-    best: Optional[AtomicLimitation] = None
+    best: Optional[Limitation] = None
     best_ratio = 0.0
     for segment in segments:
         seg_norm = " ".join(segment.text.split()).lower()
@@ -169,45 +184,6 @@ def _snap_to_segment(
     if best is not None and best_ratio >= 0.6:
         return best
     return None
-
-
-#: Transitional phrase ending a US claim preamble; the delimiter stays with
-#: the preamble ("... comprising:" / "... consisting of:").
-_PREAMBLE_RE = re.compile(r"\b(?:compris(?:ing|es)|consist(?:ing|s)\s+of)\s*:?", re.IGNORECASE)
-
-#: Element delimiter: ";" optionally followed by the conjunction "and", which
-#: stays with the preceding element ("...; and").
-_ELEMENT_DELIM_RE = re.compile(r";(?:\s+and\b)?")
-
-
-def _structural_split(claim_text: str) -> list[AtomicLimitation]:
-    """Deterministically split a US-style claim into verbatim segments.
-
-    The preamble ends at the transitional phrase ("comprising:" etc., kept
-    with the preamble); elements are then split on ";" / "; and" (delimiters
-    kept with the preceding element). Whitespace is trimmed from each segment
-    but spans always index into the original claim text.
-    """
-    boundaries: list[tuple[int, int]] = []
-    cursor = 0
-    preamble = _PREAMBLE_RE.search(claim_text)
-    if preamble:
-        boundaries.append((0, preamble.end()))
-        cursor = preamble.end()
-    for match in _ELEMENT_DELIM_RE.finditer(claim_text, cursor):
-        boundaries.append((cursor, match.end()))
-        cursor = match.end()
-    if claim_text[cursor:].strip():
-        boundaries.append((cursor, len(claim_text)))
-
-    limitations: list[AtomicLimitation] = []
-    for start, end in boundaries:
-        segment = claim_text[start:end]
-        s = start + (len(segment) - len(segment.lstrip()))
-        e = end - (len(segment) - len(segment.rstrip()))
-        if e > s:
-            limitations.append(AtomicLimitation(text=claim_text[s:e], span=(s, e)))
-    return limitations
 
 
 def generate_keywords(

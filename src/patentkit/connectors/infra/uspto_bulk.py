@@ -32,6 +32,7 @@ from patentkit.models.patent import (
     PatentNumber,
     SourceRecord,
 )
+from patentkit.parsing.claims import split_limitations
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +132,8 @@ def _parse_claims(root: ET.Element) -> list[Claim]:
                     depends_on = int(match.group(1))
         if depends_on == number:
             depends_on = None
-        claims.append(Claim(number=number, text=text, depends_on=depends_on))
+        claims.append(Claim(number=number, text=text, depends_on=depends_on,
+                            limitations=split_limitations(text, number)))
     return claims
 
 

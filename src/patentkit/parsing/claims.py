@@ -1,8 +1,10 @@
 """Pure-python parsing of patent claim text into the canonical claim model.
 
 No LLMs, no optional dependencies: numbered-claim splitting, dependency
-detection, and a heuristic element tree built from claim punctuation
-conventions (":" preamble, ";" elements, "wherein"/"whereby" clauses).
+detection, deterministic limitation splitting (the PRIMARY mechanism for
+producing :class:`~patentkit.models.Limitation` units at parse time), and a
+heuristic element tree built from claim punctuation conventions (":"
+preamble, ";" elements, "wherein"/"whereby" clauses).
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ from __future__ import annotations
 import logging
 import re
 
-from patentkit.models import Claim, ClaimElement
+from patentkit.models import Claim, ClaimElement, Limitation
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +76,72 @@ def parse_claims(claims_text: str) -> list[Claim]:
                 text=text,
                 depends_on=depends_on,
                 elements=_build_element_tree(text),
+                limitations=split_limitations(text, number),
             )
         )
     return claims
+
+
+#: Transitional phrase ending a US claim preamble; the delimiter stays with
+#: the preamble ("... comprising:" / "... consisting of:").
+_PREAMBLE_RE = re.compile(r"\b(?:compris(?:ing|es)|consist(?:ing|s)\s+of)\s*:?", re.IGNORECASE)
+
+#: Element delimiter: ";" optionally followed by the conjunction "and", which
+#: stays with the preceding element ("...; and").
+_ELEMENT_DELIM_RE = re.compile(r";(?:\s+and\b)?")
+
+
+def element_label(claim_number: int, index: int) -> str:
+    """Bracket-letter label for the ``index``-th (0-based) claim element:
+    "1[a]", "1[b]", ... "1[z]", "1[aa]", ..."""
+    letters = ""
+    i = index + 1
+    while i:
+        i, remainder = divmod(i - 1, 26)
+        letters = chr(ord("a") + remainder) + letters
+    return f"{claim_number}[{letters}]"
+
+
+def split_limitations(claim_text: str, claim_number: int) -> list[Limitation]:
+    """Deterministically split a US-style claim into verbatim limitation units.
+
+    This is the PRIMARY limitation-splitting mechanism, run at index/parse
+    time (no LLM): the preamble ends at the transitional phrase
+    ("comprising:" / "consisting of:", kept with the preamble) and gets the
+    label "N[pre]"; the remaining elements are split on ";" / "; and"
+    (delimiters kept with the preceding element) and labeled "N[a]", "N[b]",
+    ... in document order. A claim with no transitional phrase and no
+    semicolons yields a single limitation. Whitespace is trimmed from each
+    segment, but every ``text`` is a verbatim slice of ``claim_text`` and
+    every ``span`` indexes into the original claim text.
+    """
+    boundaries: list[tuple[int, int, bool]] = []  # (start, end, is_preamble)
+    cursor = 0
+    preamble = _PREAMBLE_RE.search(claim_text)
+    if preamble:
+        boundaries.append((0, preamble.end(), True))
+        cursor = preamble.end()
+    for match in _ELEMENT_DELIM_RE.finditer(claim_text, cursor):
+        boundaries.append((cursor, match.end(), False))
+        cursor = match.end()
+    if claim_text[cursor:].strip():
+        boundaries.append((cursor, len(claim_text), False))
+
+    limitations: list[Limitation] = []
+    element_index = 0
+    for start, end, is_preamble in boundaries:
+        segment = claim_text[start:end]
+        s = start + (len(segment) - len(segment.lstrip()))
+        e = end - (len(segment) - len(segment.rstrip()))
+        if e <= s:
+            continue
+        if is_preamble:
+            label = f"{claim_number}[pre]"
+        else:
+            label = element_label(claim_number, element_index)
+            element_index += 1
+        limitations.append(Limitation(label=label, text=claim_text[s:e], span=(s, e)))
+    return limitations
 
 
 def _detect_dependency(claim_text: str) -> int | None:

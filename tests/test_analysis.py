@@ -4,7 +4,7 @@ from patentkit.analysis import (
     build_claim_chart,
     check_antecedent_basis,
     generate_keywords,
-    split_atomic_limitations,
+    refine_limitations,
 )
 from patentkit.models import Claim, Patent, PatentNumber
 from patentkit.parsing import parse_claims
@@ -60,7 +60,10 @@ def assert_verbatim_in_order(limitations, claim_text):
     assert len(set(starts)) == len(starts)  # strictly increasing
 
 
-class TestSplitAtomicLimitations:
+class TestRefineLimitations:
+    """refine_limitations is an OPTIONAL LLM pass over the precomputed
+    deterministic units; verbatimness and ordering are enforced in code."""
+
     def test_verbatim_segments_sorted_into_claim_order(self):
         claim = Claim(number=1, text=DETECT_CLAIM_TEXT)
         # LLM returns verbatim segments but OUT of order and with sloppy
@@ -74,30 +77,38 @@ class TestSplitAtomicLimitations:
                 ]
             ]
         )
-        limitations = split_atomic_limitations(claim, llm=llm)
+        limitations = refine_limitations(claim, llm=llm)
         assert_verbatim_in_order(limitations, DETECT_CLAIM_TEXT)
         # (c) preamble first, then the first element after the preamble
         assert limitations[0].text == DETECT_PREAMBLE
         assert limitations[1].text == DETECT_ELEMENT_1
         # whitespace-sloppy segment was re-sliced verbatim from the claim
         assert limitations[2].text == "an output device for presenting the data;"
-        assert len(llm.prompts) == 1  # single split call, no span-mapping call
+        # relabeled in order: preamble keeps [pre], elements get letters
+        assert [lim.label for lim in limitations] == ["1[pre]", "1[a]", "1[b]"]
+        assert len(llm.prompts) == 1  # single refine call, no span-mapping call
+        # the deterministic units were offered to the LLM as the baseline
+        assert DETECT_ELEMENT_1 in llm.prompts[0]
 
-    def test_llm_none_uses_deterministic_structural_split(self):
+    def test_llm_none_returns_precomputed_limitations(self):
         claim = Claim(number=1, text=DETECT_CLAIM_TEXT)
-        limitations = split_atomic_limitations(claim, llm=None)
+        limitations = refine_limitations(claim, llm=None)
+        assert limitations == claim.get_limitations()
         assert_verbatim_in_order(limitations, DETECT_CLAIM_TEXT)
-        texts = [lim.text for lim in limitations]
-        assert texts[0] == DETECT_PREAMBLE
-        assert texts[1] == DETECT_ELEMENT_1
-        assert texts[2] == "an output device for presenting the data;"
-        # "; and" delimiter stays with the preceding element
-        assert texts[3].endswith("to the detected structures; and")
-        assert texts[4].startswith("a processing unit coupled to")
-        # together the segments cover essentially the whole claim
-        assert normalize(" ".join(texts)) == normalize(DETECT_CLAIM_TEXT)
 
-    def test_paraphrasing_llm_falls_back_to_verbatim_segments(self):
+    def test_merging_segments_is_allowed_and_relabeled(self):
+        claim = Claim(number=1, text=DETECT_CLAIM_TEXT)
+        merged = (
+            "an input device for receiving data; an output device for "
+            "presenting the data;"
+        )
+        llm = FakeLLM(responses=[[DETECT_PREAMBLE, merged]])
+        limitations = refine_limitations(claim, llm=llm)
+        assert_verbatim_in_order(limitations, DETECT_CLAIM_TEXT)
+        assert [lim.label for lim in limitations] == ["1[pre]", "1[a]"]
+        assert limitations[1].text == merged
+
+    def test_paraphrasing_llm_falls_back_to_deterministic_units(self):
         claim = Claim(number=1, text=DETECT_CLAIM_TEXT)
         llm = FakeLLM(
             responses=[
@@ -107,7 +118,7 @@ class TestSplitAtomicLimitations:
                 ]
             ]
         )
-        limitations = split_atomic_limitations(claim, llm=llm)
+        limitations = refine_limitations(claim, llm=llm)
         # paraphrases never survive: result is verbatim, in order
         assert_verbatim_in_order(limitations, DETECT_CLAIM_TEXT)
         assert limitations[0].text == DETECT_PREAMBLE
@@ -118,7 +129,7 @@ class TestSplitAtomicLimitations:
     def test_case_insensitive_fallback_match(self):
         claim = Claim(number=1, text=CLAIM_TEXT)
         llm = FakeLLM(responses=[["A widget comprising:", "A MOTOR coupled to the frame."]])
-        limitations = split_atomic_limitations(claim, llm=llm)
+        limitations = refine_limitations(claim, llm=llm)
         assert_verbatim_in_order(limitations, CLAIM_TEXT)
         # re-sliced with the claim's original casing
         assert limitations[1].text == "a motor coupled to the frame."
@@ -126,14 +137,17 @@ class TestSplitAtomicLimitations:
 
 class TestBuildClaimChart:
     def test_end_to_end_and_coverage_math(self):
+        # Rows are the PRECOMPUTED structural units: preamble, "lim A; and",
+        # "lim B." — the LLM is only used for disclosure assessment.
         patent = make_patent([Claim(number=1, text="A device comprising: lim A; and lim B.")])
         llm = FakeLLM(
             responses=[
-                ["lim A", "lim B"],  # split (verbatim segments of the claim)
-                # reference US111: lim A disclosed, lim B not
+                # reference US111: preamble + lim A disclosed, lim B not
+                {"status": "disclosed", "reasoning": "device taught", "quotes": []},
                 {"status": "disclosed", "reasoning": "teaches A", "quotes": ["the art shows A"]},
                 {"status": "not disclosed", "reasoning": "silent on B", "quotes": []},
-                # reference US222: lim A not, lim B disclosed
+                # reference US222: preamble + lim B disclosed, lim A not
+                {"status": "disclosed", "reasoning": "device taught", "quotes": []},
                 {"status": "not_disclosed", "reasoning": "silent on A", "quotes": []},
                 {"status": "disclosed", "reasoning": "teaches B", "quotes": ["the art shows B"]},
             ]
@@ -145,24 +159,26 @@ class TestBuildClaimChart:
         )
         assert chart.query_patent == "US10123456B2"
         assert chart.claim_number == 1
-        assert [lim.text for lim in chart.limitations] == ["lim A", "lim B"]
+        assert [lim.text for lim in chart.limitations] == [
+            "A device comprising:", "lim A; and", "lim B.",
+        ]
+        assert [lim.label for lim in chart.limitations] == ["1[pre]", "1[a]", "1[b]"]
         assert len(chart.references) == 2
-        assert chart.references[0].findings[0].status == "disclosed"
-        assert chart.references[0].findings[0].quotes == ["the art shows A"]
-        assert chart.references[0].findings[1].status == "not_disclosed"
+        assert chart.references[0].findings[1].status == "disclosed"
+        assert chart.references[0].findings[1].quotes == ["the art shows A"]
+        assert chart.references[0].findings[2].status == "not_disclosed"
 
-        # coverage math: each reference discloses 1 of 2 limitations
-        assert chart.coverage_summary() == {"US111": 0.5, "US222": 0.5}
-        # but together they cover both
+        # coverage math: each reference discloses 2 of 3 limitations
+        assert chart.coverage_summary() == {"US111": 2 / 3, "US222": 2 / 3}
+        # but together they cover all three
         assert chart.combined_coverage() == 1.0
-        # 1 split call + 4 assess calls
-        assert len(llm.prompts) == 5
+        # NO split call — 6 assess calls only
+        assert len(llm.prompts) == 6
 
     def test_locator_attaches_citations(self):
         patent = make_patent([Claim(number=1, text="A device comprising: lim A.")])
         llm = FakeLLM(
             responses=[
-                ["A device comprising:", "lim A."],
                 {"status": "disclosed", "reasoning": "r", "quotes": ["quoted passage"]},
                 {"status": "disclosed", "reasoning": "r", "quotes": []},
             ]
@@ -172,6 +188,23 @@ class TestBuildClaimChart:
             llm=llm, locator=lambda passage: "col. 3, ll. 45-52",
         )
         assert chart.references[0].findings[0].citation == "col. 3, ll. 45-52"
+
+    def test_precomputed_limitations_are_respected(self):
+        # A pre-populated claim.limitations (e.g. from refine_limitations)
+        # is used as-is — never re-split.
+        from patentkit.models import Limitation
+
+        claim = Claim(
+            number=1, text="A device comprising: lim A; and lim B.",
+            limitations=[Limitation(label="1[a]", text="lim A; and lim B.")],
+        )
+        patent = make_patent([claim])
+        llm = FakeLLM(responses=[
+            {"status": "disclosed", "reasoning": "r", "quotes": []},
+        ])
+        chart = build_claim_chart(patent, 1, references=[("US111", "ref text")], llm=llm)
+        assert [lim.label for lim in chart.limitations] == ["1[a]"]
+        assert len(llm.prompts) == 1  # one assess call for the single unit
 
     def test_missing_claim_raises(self):
         patent = make_patent([Claim(number=1, text="A device.")])

@@ -1,7 +1,8 @@
 """Invalidity analysis: per-reference disclosure assessment and claim charts.
 
-Pipeline (mirrors the production claim-chart flow): split the claim into
-atomic limitations, then for each reference assess disclosure of every
+Pipeline (mirrors the production claim-chart flow): take the claim's
+PRECOMPUTED limitation units (:meth:`patentkit.models.Claim.get_limitations`
+— deterministic, no LLM), then for each reference assess disclosure of every
 limitation (HIGH effort, one call per limitation), optionally attaching
 citations via a caller-supplied locator (e.g. built on
 :func:`patentkit.parsing.patent_pdf.locate_passage`).
@@ -14,10 +15,9 @@ from typing import Callable, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from patentkit.analysis.claims_analysis import split_atomic_limitations
 from patentkit.analysis.prompts import ASSESS_DISCLOSURE
 from patentkit.llm.base import LLM, get_llm
-from patentkit.models import AtomicLimitation, Patent
+from patentkit.models import Limitation, Patent
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +36,9 @@ Locator = Callable[[str], Optional[str]]
 
 
 class DisclosureFinding(BaseModel):
-    """Whether one reference discloses one atomic limitation."""
+    """Whether one reference discloses one claim limitation."""
 
-    limitation: AtomicLimitation
+    limitation: Limitation
     status: DisclosureStatus
     reasoning: str = ""
     quotes: list[str] = Field(default_factory=list)
@@ -65,7 +65,7 @@ class ClaimChart(BaseModel):
     query_patent: str
     claim_number: int
     interpreted_claim: Optional[str] = None
-    limitations: list[AtomicLimitation] = Field(default_factory=list)
+    limitations: list[Limitation] = Field(default_factory=list)
     references: list[ReferenceChart] = Field(default_factory=list)
 
     def coverage_summary(self) -> dict[str, float]:
@@ -98,7 +98,7 @@ def _normalize_status(raw: object) -> DisclosureStatus:
 
 
 def assess_reference(
-    claim_limitations: list[AtomicLimitation],
+    claim_limitations: list[Limitation],
     reference_text: str,
     reference_number: str,
     reference_title: Optional[str] = None,
@@ -164,9 +164,12 @@ def build_claim_chart(
 ) -> ClaimChart:
     """Build a claim chart for one claim against several references (HIGH effort).
 
-    Orchestrates: atomic-limitation splitting (reusing precomputed
-    ``claim.atomic_limitations`` when present) followed by per-reference
-    disclosure assessment.
+    The chart rows are the claim's PRECOMPUTED limitation units
+    (``claim.get_limitations()`` — deterministic; no LLM is needed for
+    splitting), followed by per-reference disclosure assessment (which does
+    use the LLM). Callers wanting LLM-merged/split rows may pre-populate
+    ``claim.limitations`` via
+    :func:`patentkit.analysis.claims_analysis.refine_limitations`.
 
     Args:
         query_patent: the patent whose claim is being charted.
@@ -180,7 +183,7 @@ def build_claim_chart(
         raise ValueError(f"Claim {claim_number} not found in {query_patent.patent_number}")
     llm = llm or get_llm("high")
 
-    limitations = claim.atomic_limitations or split_atomic_limitations(claim, query_patent, llm=llm)
+    limitations = claim.get_limitations()
     reference_charts = [
         assess_reference(limitations, text, number, llm=llm, locator=locator)
         for number, text in references

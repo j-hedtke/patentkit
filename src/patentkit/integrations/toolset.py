@@ -47,7 +47,7 @@ of an invalidity search.
 Patent {patent}, claim {claim_number}:
 {claim}
 
-Atomic limitations of the claim:
+Limitations of the claim:
 {limitations}
 
 Prosecution-history excerpts (office actions, applicant remarks, notice of \
@@ -541,7 +541,6 @@ class PatentToolset:
         only missing (limitation, reference) pairs are assessed. The merged
         chart is cached for export_claim_chart_docx."""
         try:
-            from patentkit.analysis.claims_analysis import split_atomic_limitations  # noqa: PLC0415
             from patentkit.analysis.invalidity import (  # noqa: PLC0415
                 ClaimChart,
                 ReferenceChart,
@@ -563,9 +562,9 @@ class PatentToolset:
 
         cached = self._cached_chart(patent, claim_number)
         try:
+            # the claim's precomputed structural units (deterministic — no LLM)
             limitations = ((cached.limitations if cached is not None else None)
-                           or claim.atomic_limitations
-                           or split_atomic_limitations(claim, target, llm=self.llm))
+                           or claim.get_limitations())
         except Exception as exc:  # noqa: BLE001
             return {"error": f"Could not split claim {claim_number} into limitations: {exc}"}
         needle = " ".join(str(limitation).split()).lower()
@@ -626,6 +625,7 @@ class PatentToolset:
             "patent": str(target.patent_number),
             "claim_number": int(claim_number),
             "limitation": match.text,
+            "label": match.label,
             "references": [r.model_dump(mode="json") for r in reference_charts],
             "reused_assessments": reused,
             "new_assessments": assessed,
@@ -694,11 +694,6 @@ class PatentToolset:
         result includes display markdown, and key_limitations can be passed
         straight to guided_search_start."""
         try:
-            from patentkit.analysis.claims_analysis import split_atomic_limitations  # noqa: PLC0415
-        except ImportError:
-            return {"error": "summarize_key_limitations requires patentkit.analysis "
-                             "(not available in this installation)."}
-        try:
             target = self._fetch_patent(patent)
         except (LookupError, ValueError) as exc:
             return {"error": str(exc)}
@@ -706,8 +701,8 @@ class PatentToolset:
         if claim is None:
             return {"error": f"Claim {claim_number} not found in {target.patent_number}"}
         try:
-            limitations = claim.atomic_limitations or split_atomic_limitations(
-                claim, target, llm=self.llm)
+            # the claim's precomputed structural units (deterministic — no LLM)
+            limitations = claim.get_limitations()
         except Exception as exc:  # noqa: BLE001
             return {"error": f"Could not split claim {claim_number} into limitations: {exc}"}
         limitation_texts = [lim.text for lim in limitations]
@@ -721,27 +716,31 @@ class PatentToolset:
             return self._summarize_from_wrapper(target, claim, limitation_texts, wrapper_text)
 
         # Degraded path: no prosecution-history context (or no LLM to read it).
+        # No LLM is needed here — the precomputed limitation units are returned.
         if wrapper_text:  # have the history but no LLM to read it
             note = ("No LLM configured to read the prosecution history; "
-                    "returning ALL limitations from a claim split.")
+                    "returning ALL precomputed limitations of the claim.")
         elif wrapper_error:
-            note = ("File-wrapper retrieval failed; returning ALL limitations "
-                    f"from a claim split. Error: {wrapper_error}")
+            note = ("File-wrapper retrieval failed; returning ALL precomputed "
+                    f"limitations of the claim. Error: {wrapper_error}")
         elif os.environ.get("USPTO_ODP_API_KEY"):
             note = ("The file wrapper contained no readable documents; "
-                    "returning ALL limitations from a claim split.")
+                    "returning ALL precomputed limitations of the claim.")
         else:
             note = ("File-wrapper (prosecution-history) context is unavailable "
-                    "without USPTO_ODP_API_KEY; returning ALL limitations from a "
-                    "claim split instead of the allowance-critical ones.")
+                    "without USPTO_ODP_API_KEY; returning ALL precomputed "
+                    "limitations of the claim instead of the allowance-critical "
+                    "ones.")
         lines = [f"## Claim limitations — {target.patent_number}, claim {claim_number}",
                  "", f"_{note}_", ""]
-        lines += [f"{i}. {text}" for i, text in enumerate(limitation_texts, start=1)]
+        lines += [f"- **{lim.label}** {lim.text}" if lim.label else f"- {lim.text}"
+                  for lim in limitations]
         return {
             "patent": str(target.patent_number),
             "claim_number": int(claim_number),
             "mode": "claim_split_only",
             "key_limitations": limitation_texts,
+            "limitations": [{"label": lim.label, "text": lim.text} for lim in limitations],
             "note": note,
             "markdown": "\n".join(lines),
         }
